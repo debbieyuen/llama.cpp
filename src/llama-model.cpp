@@ -31,6 +31,9 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #include <functional>
 #include <map>
 #include <numeric>
@@ -1887,6 +1890,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
+    // kimi-k3-spark patch 0003: with an expert store the host experts are read from the store with O_DIRECT
+    // and never from the mapping, so keep them out of its prefetch (a MAP_POPULATE of ~545 GB that only
+    // evicts itself again); the spine and any RPC-bound experts are still prefetched
+    if (const char * store = getenv("LLAMA_EXPERT_STORE"); store != nullptr && store[0] != '\0' && ml.use_mmap) {
+        size_t n_excluded = 0;
+        size_t n_bytes    = 0;
+        for (auto & [key, ctx_ptr] : ml.ctx_map) {
+            if (key.lazy || !ggml_backend_buft_is_host(key.buft)) {
+                continue;
+            }
+            for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
+                const std::string name = ggml_get_name(cur);
+                if (name.find(".ffn_") == std::string::npos || name.find("_exps") == std::string::npos) {
+                    continue;
+                }
+                ml.lazy.exclude_prefetch(ml.require_weight(name.c_str()), cur);
+                n_excluded++;
+                n_bytes += ggml_nbytes(cur);
+            }
+        }
+        LLAMA_LOG_INFO("%s: expert store: %zu host expert tensors (%.1f GB) excluded from the mapping prefetch\n",
+            __func__, n_excluded, n_bytes/1e9);
+    }
+
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
@@ -2029,6 +2056,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             return false;
         }
     }
+
+#if defined(__linux__) && defined(MADV_PAGEOUT)
+    // kimi-k3-spark patch 0003: with the expert store the mapping serves nothing after the load (the spine was
+    // copied to the device, the experts come from the store), so give its page cache back right away: the MoE
+    // cache is sized against that RAM. A CPU tensor still in the mapping (the token embeddings) faults its page
+    // back in when read. LLAMA_EXPERT_STORE_KEEP_PAGE_CACHE=1 keeps it.
+    if (use_mmap_buffer && getenv("LLAMA_EXPERT_STORE") != nullptr &&
+        !(getenv("LLAMA_EXPERT_STORE_KEEP_PAGE_CACHE") != nullptr && getenv("LLAMA_EXPERT_STORE_KEEP_PAGE_CACHE")[0] == '1')) {
+        size_t n_failed = 0;
+        int    err_last = 0;
+        for (auto & mapping : ml.mappings) {
+            if (madvise(mapping->addr(), mapping->size(), MADV_PAGEOUT) != 0) {
+                n_failed++;
+                err_last = errno;
+            }
+        }
+        if (n_failed > 0) {
+            // ENOMEM here means part of the range could not be paged out (locked or unmapped pages), not a failure
+            // of the load: one line for all the mappings
+            LLAMA_LOG_WARN("%s: madvise(MADV_PAGEOUT) failed for %zu of %zu mappings: %s\n", __func__, n_failed, ml.mappings.size(), strerror(err_last));
+        }
+        LLAMA_LOG_INFO("%s: expert store: the mapping's page cache was released after the load\n", __func__);
+    }
+#endif
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {

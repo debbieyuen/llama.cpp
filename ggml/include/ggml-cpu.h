@@ -125,6 +125,11 @@ extern "C" {
 
     GGML_BACKEND_API void ggml_cpu_init(void);
 
+    // kimi-k3-spark patch 0003: a hook called on the thread that starts a graph compute, before any node
+    // runs; llama.cpp uses it to fill its expert store cache for the MUL_MAT_ID nodes of the graph
+    typedef void (*ggml_cpu_graph_hook_t)(struct ggml_cgraph * cgraph, void * user_data);
+    GGML_BACKEND_API void ggml_cpu_set_graph_hook(ggml_cpu_graph_hook_t hook, void * user_data);
+
     //
     // CPU backend
     //

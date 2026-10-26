@@ -5,6 +5,20 @@
 
 #include <cstdint>
 
+// kimi-k3-spark patch 0003: the experts of a MoE cache bank number in the tens of thousands (its slots), a batch uses
+// a few hundred of them at most, and the kernel's z dimension walks every expert. Compact the ones with columns into
+// a list: out[0] = count, out[1..] = the expert indices (any order).
+static __global__ void k_mmq_compact_experts(const int32_t * __restrict__ expert_bounds, const int n_experts, int32_t * __restrict__ out) {
+    const int e = blockIdx.x*blockDim.x + threadIdx.x;
+    if (e >= n_experts) {
+        return;
+    }
+    if (expert_bounds[e + 1] > expert_bounds[e]) {
+        const int i = atomicAdd(out, 1);
+        out[1 + i] = e;
+    }
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -173,9 +187,12 @@ void ggml_cuda_mul_mat_q(
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s1  =  dst->nb[1] / ts_dst;
-    const int64_t s02 = src0->nb[2] / ts_src0;
+    // the per-channel and per-sample strides of x are passed in bytes and applied to the
+    // pointer inside the kernel (64-bit): a MoE bank of tens of thousands of expert slots
+    // overflows a 32-bit block index
+    const int64_t s02 = src0->nb[2];
     const int64_t s2  =  dst->nb[2] / ts_dst;
-    const int64_t s03 = src0->nb[3] / ts_src0;
+    const int64_t s03 = src0->nb[3];
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
     const bool fallback = ggml_cuda_mmq_needs_fallback(ne01);
@@ -268,7 +285,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1, J_best};
+            ne1, J_best, nullptr};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;
     }
@@ -341,13 +358,39 @@ void ggml_cuda_mul_mat_q(
     const int64_t s13 = ne12*s12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
+    // A MoE cache bank (kimi-k3-spark patch 0003) has tens of thousands of expert slots and a batch uses a few hundred:
+    // walk a compacted list of the experts with columns instead of every slot. The count comes back to the host
+    // (one small sync), unless a CUDA graph is being captured, in which case the bound of the batch is used.
+    int64_t n_channels = ne02;
+    ggml_cuda_pool_alloc<int32_t> expert_list(ctx.pool());
+    const int32_t * expert_list_d = nullptr;
+    static const bool no_compact = getenv("GGML_CUDA_MMQ_NO_COMPACT") != nullptr && getenv("GGML_CUDA_MMQ_NO_COMPACT")[0] == '1';
+    if (ne02 > 1024 && !no_compact) {
+        expert_list.alloc(ne02 + 1);
+        CUDA_CHECK(cudaMemsetAsync(expert_list.get(), 0, sizeof(int32_t), stream));
+        k_mmq_compact_experts<<<(ne02 + 255)/256, 256, 0, stream>>>(expert_bounds.get(), (int) ne02, expert_list.get());
+        CUDA_CHECK(cudaGetLastError());
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+        if (capture == cudaStreamCaptureStatusNone) {
+            int32_t n_list = 0;
+            CUDA_CHECK(cudaMemcpyAsync(&n_list, expert_list.get(), sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            if (n_list == 0) {
+                return;
+            }
+            n_channels   = n_list;
+            expert_list_d = expert_list.get() + 1;
+        }
+        // while capturing a CUDA graph the count cannot be read back: walk every slot as before (exact, just slow)
+    }
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
-        ne02, ne02, s02, s12, s2,
+        n_channels, n_channels, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12, J_best};
+        ne12, J_best, expert_list_d};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }

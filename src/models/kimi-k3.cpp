@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include "llama-memory-recurrent.h"
+#include "llama-moe-cache.h"
 
 //
 // Kimi-K3 text model: hybrid KDA (linear) + MLA (full) attention, as in kimi-linear.
@@ -233,6 +234,60 @@ ggml_tensor * llama_model_kimi_k3::graph::res_mix(ggml_tensor * cur, ggml_tensor
     return out;
 }
 
+// res_mix for the prefetch predictor: the stack plus an optional checkpoint the target layer will have pushed
+ggml_tensor * llama_model_kimi_k3::graph::res_mix_pred(ggml_tensor * cur, ggml_tensor * score_w,
+                                                       ggml_tensor * extra_ckpt, int64_t n_tokens) {
+    const int64_t n_embd = cur->ne[0];
+    ggml_tensor * src = resi_stack;
+    if (extra_ckpt != nullptr) {
+        ggml_tensor * ckpt = ggml_reshape_3d(ctx0, extra_ckpt, n_embd, 1, n_tokens);
+        src = src ? ggml_concat(ctx0, src, ckpt, 1) : ckpt;
+    }
+    if (src == nullptr) {
+        return cur;
+    }
+    const int   n_ckpt = (int) src->ne[1];
+    const float eps    = hparams.f_norm_rms_eps;
+    ggml_tensor * sc_src = ggml_rms_norm(ctx0, src, eps);
+    sc_src = ggml_mul(ctx0, sc_src, score_w);
+    sc_src = ggml_sum_rows(ctx0, sc_src);
+    sc_src = ggml_reshape_2d(ctx0, sc_src, n_ckpt, n_tokens);
+    ggml_tensor * sc_cur = ggml_rms_norm(ctx0, cur, eps);
+    sc_cur = ggml_mul(ctx0, sc_cur, score_w);
+    sc_cur = ggml_sum_rows(ctx0, sc_cur);
+    ggml_tensor * scores = ggml_concat(ctx0, sc_src, sc_cur, 0);
+    ggml_tensor * probs  = ggml_soft_max(ctx0, scores);
+    ggml_tensor * p_src = ggml_cont(ctx0, ggml_view_2d(ctx0, probs, n_ckpt, n_tokens, probs->nb[1], 0));
+    ggml_tensor * p_cur = ggml_cont(ctx0, ggml_view_2d(ctx0, probs, 1, n_tokens, probs->nb[1], probs->nb[0] * n_ckpt));
+    ggml_tensor * out = ggml_dsv4_hc_pre(ctx0, src, p_src);
+    out = ggml_add(ctx0, out, ggml_mul(ctx0, cur, p_cur));
+    return out;
+}
+
+// LLAMA_EXPERT_STORE_PREFETCH_INPUT=2: the next layer's router input less its attention and this layer's routed
+// output: the residual stream before this layer's FFN plus the shared expert, mixed the way the next layer's FFN
+// mixes it (its own residual scores; on a checkpoint layer the stream restarts from the attention output, which is
+// unknown, so the stack plus the stream as the new checkpoint stand in). Measured on 400 decode tokens: top-16
+// precision 0.675 vs 0.614 for input 1, the checkpoint layer and the one after it 0.48 / 0.58 vs 0.34 / 0.46.
+ggml_tensor * llama_model_kimi_k3::graph::build_prefetch_input2(ggml_tensor * sh, int il_next, int64_t n_tokens, ggml_tensor * extra) {
+    const uint32_t res_bs = hparams.attn_res_block_size;
+    if (res_bs == 0 || pred_ps_attn == nullptr || n_tokens > 4 || il_next >= (int) model.layers.size()) {
+        return nullptr;
+    }
+    const auto & next = model.layers[il_next];
+    if (next.ffn_res_score == nullptr || next.ffn_norm == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor * base = ggml_add(ctx0, pred_ps_attn, sh);
+    if (extra != nullptr) {
+        base = ggml_add(ctx0, base, extra);
+    }
+    ggml_tensor * x = (uint32_t) il_next % res_bs == 0
+        ? res_mix_pred(ggml_scale(ctx0, base, 0.0f), next.ffn_res_score, base, n_tokens)
+        : res_mix_pred(base, next.ffn_res_score, nullptr, n_tokens);
+    return build_norm(x, next.ffn_norm, NULL, LLM_NORM_RMS, il_next);
+}
+
 llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
 
@@ -309,6 +364,9 @@ llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_par
         cur = use_attn_res ? res_mix(prefix_sum, layer.ffn_res_score, n_tokens, il)
                            : prefix_sum;
 
+        ggml_tensor * ps_attn = prefix_sum; // the residual stream before this layer's FFN (prefetch predictor)
+        pred_ps_attn = ps_attn;
+        ggml_tensor * ffn_inp = cur; // un-normed, for the prefetch predictor
         cur = build_norm(cur, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
@@ -319,12 +377,46 @@ llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_par
             cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
             cb(cur, "ffn_out", il);
         } else {
-            cur = build_latent_moe(cur, layer, n_embd_latent, il);
+            cur = build_latent_moe(cur, ffn_inp, layer, n_embd_latent, il);
         }
 
         prefix_sum = ggml_add(ctx0, prefix_sum, cur);
         prefix_sum = build_cvec(prefix_sum, il);
         cb(prefix_sum, "l_out", il);
+
+        // measurement only (LLAMA_EXPERT_STORE_PREFETCH_DUMP=1, tools/k3-pfdump): alternative inputs of the next
+        // layers' routers, through the residual mixing the target layer applies. pfv2/pfv3: one layer ahead from the
+        // stream plus the shared expert (pfv2) or plus the whole FFN output (pfv3); pfv4/pfv5: the same two layers ahead.
+        static const bool pf_dump = getenv("LLAMA_EXPERT_STORE_PREFETCH_DUMP") != nullptr;
+        if (pf_dump && use_attn_res && (uint32_t) il >= hparams.n_layer_dense_lead && last_sh != nullptr && n_tokens <= 4) {
+            ggml_tensor * A = ggml_add(ctx0, ps_attn, last_sh);
+            ggml_tensor * B = prefix_sum;
+            for (int ahead = 1; ahead <= 2; ahead++) {
+                const int iln = il + ahead;
+                if (iln >= n_layer || model.layers[iln].ffn_gate_inp == nullptr || model.layers[iln].ffn_res_score == nullptr) {
+                    continue;
+                }
+                const bool ckpt = ((uint32_t) iln % res_bs == 0) || (ahead == 2 && (uint32_t) (il + 1) % res_bs == 0);
+                for (int v = 0; v < 2; v++) {
+                    ggml_tensor * base = v == 0 ? A : B;
+                    ggml_tensor * x = ckpt ? res_mix_pred(ggml_scale(ctx0, base, 0.0f), model.layers[iln].ffn_res_score, base, n_tokens)
+                                           : res_mix_pred(base, model.layers[iln].ffn_res_score, nullptr, n_tokens);
+                    x = build_norm(x, model.layers[iln].ffn_norm, NULL, LLM_NORM_RMS, iln);
+                    ggml_tensor * pr = ggml_mul_mat(ctx0, model.layers[iln].ffn_gate_inp, x);
+                    switch ((llama_expert_gating_func_type) hparams.expert_gating_func) {
+                        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:       pr = ggml_soft_max(ctx0, pr); break;
+                        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:       pr = ggml_sigmoid(ctx0, pr); break;
+                        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS: pr = ggml_sqrt(ctx0, ggml_softplus(ctx0, pr)); break;
+                        default: break;
+                    }
+                    if (model.layers[iln].ffn_exp_probs_b != nullptr) {
+                        pr = ggml_add(ctx0, pr, model.layers[iln].ffn_exp_probs_b);
+                    }
+                    ggml_format_name(pr, "pfv%d_probs-%d", 2 + v + 2*(ahead - 1), iln);
+                    ggml_build_forward_expand(gf, pr);
+                }
+            }
+        }
 
         inpL = prefix_sum;
     }
@@ -566,7 +658,7 @@ ggml_tensor * llama_model_kimi_k3::graph::build_mla_layer(
 //
 
 ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
-        ggml_tensor * cur, const llama_layer & layer, int64_t n_embd_latent, int il) {
+        ggml_tensor * cur, ggml_tensor * inp_raw, const llama_layer & layer, int64_t n_embd_latent, int il) {
 
     ggml_tensor * identity = cur;
 
@@ -578,6 +670,72 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
     // so the logits are computed here and passed to build_moe_ffn
     ggml_tensor * logits = ggml_mul_mat(ctx0, layer.ffn_gate_inp, identity);
     cb(logits, "ffn_moe_logits", il);
+
+    // the shared expert only needs the layer input: built here (same ops), so that with self-prefetch it and the latent
+    // down projection run between the early post of the selected experts and the real lookup (see build_moe_cache_slots)
+    ggml_tensor * sh = nullptr;
+    if (layer.ffn_gate_shexp) {
+        ggml_tensor * g = ggml_mul_mat(ctx0, layer.ffn_gate_shexp, identity);
+        ggml_tensor * u = ggml_mul_mat(ctx0, layer.ffn_up_shexp,   identity);
+        sh = kimi_k3_situ(ctx0, g, u, hparams.situ_beta, hparams.situ_linear_beta);
+        sh = ggml_mul_mat(ctx0, layer.ffn_down_shexp, sh);
+        cb(sh, "ffn_shexp", il);
+    }
+    last_sh = sh;
+    moe_overlap.clear();
+    if (sh != nullptr) {
+        moe_overlap.push_back(sh);
+    }
+    if (routed_in != cur) {
+        moe_overlap.push_back(routed_in);
+    }
+
+    // kimi-k3-spark patch 0003: predict the next layer's experts from what is known before this layer's routed experts
+    // arrive, so the MoE cache can read them while this layer's matmuls and the next layer's attention run (no-op unless
+    // enabled). Built here, posted by build_moe_cache_slots right after the real lookup. Predictor inputs: this layer's
+    // router input, or (LLAMA_EXPERT_STORE_PREFETCH_INPUT=1) the un-normed FFN input plus the shared expert's output
+    // under the next layer's FFN norm, which is the next router's input less this layer's routed output and attention.
+    moe_split_partial_cb = nullptr;
+    if (il + 1 < (int) model.layers.size() && model.layers[il + 1].ffn_gate_inp != nullptr &&
+            moe_cache != nullptr && moe_cache->prefetch_enabled() && moe_cache->prefetch_input() == 3 &&
+            moe_cache->split_enabled() && cur->ne[1] == 1 && sh != nullptr && inp_raw != nullptr) {
+        // predictor input 3: input 2 plus this layer's routed output as far as it is known under the fill wait, the
+        // resident experts' weighted rows (the split GEMV's early output), through the routed norm and up projection.
+        // build_moe_ffn calls this with that partial sum and posts the prediction behind the real lookup; when the
+        // split is not taken (a multi-token batch) there is no prediction for the next layer.
+        const int64_t n_tok = cur->ne[1];
+        moe_split_partial_cb = [this, &layer, sh, identity, il, n_tok](ggml_tensor * partial) -> ggml_tensor * {
+            ggml_tensor * r = partial;
+            if (layer.ffn_routed_norm) {
+                r = build_norm(r, layer.ffn_routed_norm, NULL, LLM_NORM_RMS, il);
+            }
+            if (layer.ffn_routed_up) {
+                r = ggml_mul_mat(ctx0, layer.ffn_routed_up, r);
+            }
+            ggml_tensor * alt = build_prefetch_input2(sh, il + 1, n_tok, r);
+            if (alt == nullptr) {
+                return nullptr;
+            }
+            build_moe_cache_prefetch(identity, alt, model.layers[il + 1].ffn_gate_inp, model.layers[il + 1].ffn_exp_probs_b,
+                hparams.n_expert_used(), (llama_expert_gating_func_type) hparams.expert_gating_func, il + 1);
+            ggml_tensor * pf = moe_prefetch_node;
+            moe_prefetch_node = nullptr;
+            return pf;
+        };
+    } else if (il + 1 < (int) model.layers.size() && model.layers[il + 1].ffn_gate_inp != nullptr) {
+        ggml_tensor * alt = nullptr;
+        if (moe_cache != nullptr && moe_cache->prefetch_enabled() && sh != nullptr && inp_raw != nullptr) {
+            if (moe_cache->prefetch_input() >= 2) {
+                alt = build_prefetch_input2(sh, il + 1, cur->ne[1]);
+            }
+            if (alt == nullptr && moe_cache->prefetch_input() >= 1) {
+                alt = ggml_add(ctx0, inp_raw, sh);
+                alt = build_norm(alt, model.layers[il + 1].ffn_norm, NULL, LLM_NORM_RMS, il + 1);
+            }
+        }
+        build_moe_cache_prefetch(identity, alt, model.layers[il + 1].ffn_gate_inp, model.layers[il + 1].ffn_exp_probs_b,
+            hparams.n_expert_used(), (llama_expert_gating_func_type) hparams.expert_gating_func, il + 1);
+    }
 
     ggml_tensor * moe_out = build_moe_ffn(routed_in,
         nullptr, // gate_inp unused: the logits above are passed instead
@@ -592,6 +750,8 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
         (llama_expert_gating_func_type) hparams.expert_gating_func,
         il,
         logits);
+    moe_overlap.clear();
+    moe_split_partial_cb = nullptr;
     cb(moe_out, "ffn_moe_out", il);
 
     if (layer.ffn_routed_norm) {
@@ -602,12 +762,7 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
     }
     GGML_UNUSED(n_embd_latent);
 
-    if (layer.ffn_gate_shexp) {
-        ggml_tensor * g = ggml_mul_mat(ctx0, layer.ffn_gate_shexp, identity);
-        ggml_tensor * u = ggml_mul_mat(ctx0, layer.ffn_up_shexp,   identity);
-        ggml_tensor * sh = kimi_k3_situ(ctx0, g, u, hparams.situ_beta, hparams.situ_linear_beta);
-        sh = ggml_mul_mat(ctx0, layer.ffn_down_shexp, sh);
-        cb(sh, "ffn_shexp", il);
+    if (sh != nullptr) {
         moe_out = ggml_add(ctx0, moe_out, sh);
     }
 

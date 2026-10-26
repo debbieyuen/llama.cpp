@@ -670,6 +670,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_set_abort_callback") == 0) {
         return (void *)ggml_backend_cpu_set_abort_callback;
     }
+    if (strcmp(name, "ggml_cpu_set_graph_hook") == 0) {
+        return (void *)ggml_cpu_set_graph_hook;
+    }
     if (strcmp(name, "ggml_backend_cpu_numa_init") == 0) {
         return (void *)ggml_numa_init;
     }

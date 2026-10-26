@@ -3538,6 +3538,14 @@ static void ggml_graph_prefetch_mul_mat_id(const struct ggml_cgraph * cgraph) {
 #endif
 }
 
+static ggml_cpu_graph_hook_t g_graph_hook    = NULL;
+static void *                g_graph_hook_ud = NULL;
+
+void ggml_cpu_set_graph_hook(ggml_cpu_graph_hook_t hook, void * user_data) {
+    g_graph_hook    = hook;
+    g_graph_hook_ud = user_data;
+}
+
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
 
@@ -3545,6 +3553,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
+    if (g_graph_hook != NULL) {
+        g_graph_hook(cgraph, g_graph_hook_ud);
+    }
     ggml_graph_prefetch_mul_mat_id(cgraph);
 
     int n_threads                               = cplan->n_threads;

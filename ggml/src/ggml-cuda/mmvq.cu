@@ -738,7 +738,18 @@ static __global__ void mul_mat_vec_q(
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
-    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+    // sample and channel offsets of x applied to the pointer in 64 bits:
+    // a MoE bank of tens of thousands of expert slots overflows a 32-bit block index
+    {
+        const int64_t x_off = ((int64_t) sample_x*stride_sample_x + (int64_t) channel_x*stride_channel_x) * ggml_cuda_type_traits<type>::bs;
+        vx = (const char *) vx + x_off;
+        if constexpr (has_fusion) {
+            if (use_gate) {
+                vgate = (const char *) vgate + x_off;
+            }
+        }
+    }
+    const int kbx_offset = row0*stride_row_x;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -873,6 +884,220 @@ static __global__ void mul_mat_vec_q(
     }
 }
 
+// Hopper (cc 9.x) streaming path for Q6_K with ncols_dst == 1 on a plain 2D weight matrix.
+// A persistent grid streams tiles of R consecutive weight rows into a 2-stage shared memory ring with
+// cp.async.bulk (TMA) and computes from there. The arithmetic is exactly that of mul_mat_vec_q<Q6_K, 1>:
+// every row is still reduced by 4 warps of 32 virtual threads, thread tid handles the q6_K blocks
+// kbx = tid/16 + 8*n with the same vec_dot_q6_K_q8_1 call, the per-warp partials are summed in the same
+// order and warp_reduce_sum is the same, so the results are bit-identical. Only the memory side changes.
+#define MMVQ_Q6K_TMA_NWARPS  4
+#define MMVQ_Q6K_TMA_STAGES  2
+#define MMVQ_Q6K_TMA_MAX_SMEM (200*1024)
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+static __device__ __forceinline__ void mmvq_tma_mbar_init(uint64_t * bar, const uint32_t count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"((uint32_t) __cvta_generic_to_shared(bar)), "r"(count));
+}
+static __device__ __forceinline__ void mmvq_tma_mbar_expect_tx(uint64_t * bar, const uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                 :: "r"((uint32_t) __cvta_generic_to_shared(bar)), "r"(bytes) : "memory");
+}
+static __device__ __forceinline__ void mmvq_tma_load(void * sdst, const void * gsrc, const uint32_t bytes, uint64_t * bar, const uint64_t pol) {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;"
+                 :: "r"((uint32_t) __cvta_generic_to_shared(sdst)), "l"(gsrc), "r"(bytes),
+                    "r"((uint32_t) __cvta_generic_to_shared(bar)), "l"(pol) : "memory");
+}
+static __device__ __forceinline__ void mmvq_tma_mbar_wait(uint64_t * bar, const uint32_t phase) {
+    asm volatile("{\n\t.reg .pred p;\n"
+                 "MMVQ_TMA_WAIT_%=:\n\t"
+                 "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n\t"
+                 "@!p bra MMVQ_TMA_WAIT_%=;\n}"
+                 :: "r"((uint32_t) __cvta_generic_to_shared(bar)), "r"(phase) : "memory");
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+
+template <int R, bool has_fusion>
+__launch_bounds__(MMVQ_Q6K_TMA_NWARPS*WARP_SIZE, 1)
+static __global__ void mul_mat_vec_q6_K_tma(
+        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const uint32_t ncols_x, const uint32_t nrows_x) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+    constexpr ggml_type type = GGML_TYPE_Q6_K;
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi        = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr       = get_vdr_mmvq(type);
+    constexpr int nwarps    = MMVQ_Q6K_TMA_NWARPS;
+    constexpr int warp_size = WARP_SIZE;
+    constexpr int nstages   = MMVQ_Q6K_TMA_STAGES;
+    constexpr int ntx       = has_fusion ? 2 : 1; // up (and gate) tiles per stage
+    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+
+    extern __shared__ __align__(128) uint8_t data_mmvq_tma[];
+    __shared__ uint64_t full[nstages];
+    __shared__ float tmp_shared[2][nwarps-1][R][warp_size];
+    [[maybe_unused]] __shared__ float tmp_shared_gate[has_fusion ? 2 : 1][nwarps-1][R][warp_size];
+
+    const int tid = warp_size*threadIdx.y + threadIdx.x;
+    const int blocks_per_row_x = ncols_x / qk;
+    const uint32_t tile_bytes  = R * blocks_per_row_x * sizeof(block_q6_K);
+    const uint32_t tile_stride = (tile_bytes + 127) & ~127u;
+    const int      ntiles      = nrows_x / R;
+
+    const bool use_gate = has_fusion && fusion.gate != nullptr;
+
+    // the weights are streamed once, keep them from displacing the activations in L2
+    uint64_t pol;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+
+    if (tid == 0) {
+#pragma unroll
+        for (int s = 0; s < nstages; ++s) {
+            mmvq_tma_mbar_init(&full[s], 1);
+        }
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    __syncthreads();
+
+    const auto issue = [&](const int t, const int s) {
+        uint8_t * stage = data_mmvq_tma + s*ntx*tile_stride;
+        mmvq_tma_mbar_expect_tx(&full[s], ntx*tile_bytes);
+        mmvq_tma_load(stage, (const char *) vx + (size_t) t*tile_bytes, tile_bytes, &full[s], pol);
+        if constexpr (has_fusion) {
+            mmvq_tma_load(stage + tile_stride, (const char *) fusion.gate + (size_t) t*tile_bytes, tile_bytes, &full[s], pol);
+        }
+    };
+
+    // The weights do not depend on the preceding kernel, start streaming them before the PDL dependency sync.
+    if (tid == 0) {
+#pragma unroll
+        for (int s = 0; s < nstages; ++s) {
+            const int t = blockIdx.x + s*gridDim.x;
+            if (t < ntiles) {
+                issue(t, s);
+            }
+        }
+    }
+
+    ggml_cuda_pdl_sync();
+
+    // q8_1 activations into shared memory (16 byte chunks, sizeof(block_q8_1)*ncols_x/QK8_1 is a multiple of 16)
+    const block_q8_1 * y = (const block_q8_1 *) (data_mmvq_tma + nstages*ntx*tile_stride);
+    {
+        const int n16 = (ncols_x/QK8_1) * sizeof(block_q8_1) / 16;
+        const int4 * src = (const int4 *) vy;
+        int4 * ys = (int4 *) y;
+        for (int i = tid; i < n16; i += nwarps*warp_size) {
+            ys[i] = src[i];
+        }
+    }
+    __syncthreads();
+
+    const int kqs = vdr * (tid % (qi/vdr)); // x block quant index when casting the quants to int
+
+    int k = 0;
+    for (int t = blockIdx.x; t < ntiles; t += gridDim.x, ++k) {
+        const int s = k % nstages;
+        mmvq_tma_mbar_wait(&full[s], (k / nstages) & 1);
+        const void * tile_x    = data_mmvq_tma + s*ntx*tile_stride;
+        const void * tile_gate = data_mmvq_tma + s*ntx*tile_stride + tile_stride;
+
+        // partial sum for each thread, identical to mul_mat_vec_q
+        float tmp[R] = {0.0f};
+        float tmp_gate[R] = {0.0f};
+        for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                tmp[i] += vec_dot_q6_K_q8_1(tile_x, &y[kby], i*blocks_per_row_x + kbx, kqs);
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        tmp_gate[i] += vec_dot_q6_K_q8_1(tile_gate, &y[kby], i*blocks_per_row_x + kbx, kqs);
+                    }
+                }
+            }
+        }
+
+        // double-buffered partials: one __syncthreads per tile also releases the stage for the refill
+        if (threadIdx.y > 0) {
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                tmp_shared[k & 1][threadIdx.y-1][i][threadIdx.x] = tmp[i];
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        tmp_shared_gate[k & 1][threadIdx.y-1][i][threadIdx.x] = tmp_gate[i];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        if (threadIdx.y > 0) {
+            continue;
+        }
+
+        if (threadIdx.x == 0) {
+            const int tn = t + nstages*gridDim.x;
+            if (tn < ntiles) {
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                issue(tn, s);
+            }
+        }
+
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+#pragma unroll
+            for (int l = 0; l < nwarps-1; ++l) {
+                tmp[i] += tmp_shared[k & 1][l][i][threadIdx.x];
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        tmp_gate[i] += tmp_shared_gate[k & 1][l][i][threadIdx.x];
+                    }
+                }
+            }
+            tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+            if constexpr (has_fusion) {
+                if (use_gate) {
+                    tmp_gate[i] = warp_reduce_sum<warp_size>(tmp_gate[i]);
+                }
+            }
+
+            if (threadIdx.x == i) {
+                const int row = t*R + i;
+                float result = tmp[i];
+                if constexpr (has_fusion) {
+                    // like mul_mat_vec_q the (possibly zero) biases are always added
+                    result += fusion.x_bias != nullptr ? ((const float *) fusion.x_bias)[row] : 0.0f;
+                    if (use_gate) {
+                        float gate_value = tmp_gate[i];
+                        gate_value += fusion.gate_bias != nullptr ? ((const float *) fusion.gate_bias)[row] : 0.0f;
+                        switch (fusion.glu_op) {
+                            case GGML_GLU_OP_SWIGLU:
+                                result *= ggml_cuda_op_silu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_GEGLU:
+                                result *= ggml_cuda_op_gelu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_SWIGLU_OAI:
+                                result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                                break;
+                            case GGML_GLU_OP_SWIGLU_CLAMP:
+                                result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, fusion.glu_limit);
+                                break;
+                            default:
+                                result = result * gate_value;
+                                break;
+                        }
+                    }
+                }
+                dst[row] = result;
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(vx, vy, fusion, dst, ncols_x, nrows_x);
+    NO_DEVICE_CODE;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+}
+
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
@@ -944,7 +1169,17 @@ static __global__ void mul_mat_vec_q_moe(
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
-    const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+    // channel offset of x applied to the pointer in 64 bits (see mul_mat_vec_q)
+    {
+        const int64_t x_off = (int64_t) channel_x*stride_channel_x * ggml_cuda_type_traits<type>::bs;
+        vx = (const char *) vx + x_off;
+        if constexpr (has_fusion) {
+            if (use_gate) {
+                vgate = (const char *) vgate + x_off;
+            }
+        }
+    }
+    const int kbx_offset  = row0*stride_row_x;
 
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
@@ -1300,6 +1535,108 @@ static void mul_mat_vec_q_switch_ncols_dst(
             GGML_ABORT("fatal error");
     }
 }
+template <int R, bool has_fusion>
+static void mul_mat_vec_q6_K_tma_launch(
+        const ggml_cuda_kernel_launch_params & launch_params, const void * vx, const void * vy,
+        const ggml_cuda_mm_fusion_args_device & fusion, float * dst, const int ncols_x, const int nrows_x) {
+    // raise the dynamic shared memory limit to what this device allows next to the kernel's static shared memory
+    // (227 KiB opt-in on Hopper, ~99 KiB on the GB10)
+    static bool limit_raised[GGML_CUDA_MAX_DEVICES] = { false };
+    const int id = ggml_cuda_get_device();
+    if (!limit_raised[id]) {
+        cudaFuncAttributes attr = {};
+        CUDA_CHECK(cudaFuncGetAttributes(&attr, mul_mat_vec_q6_K_tma<R, has_fusion>));
+        const size_t limit = std::min<size_t>(MMVQ_Q6K_TMA_MAX_SMEM, ggml_cuda_info().devices[id].smpbo - attr.sharedSizeBytes);
+        CUDA_CHECK(cudaFuncSetAttribute(mul_mat_vec_q6_K_tma<R, has_fusion>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) limit));
+        limit_raised[id] = true;
+    }
+    ggml_cuda_kernel_launch(mul_mat_vec_q6_K_tma<R, has_fusion>, launch_params,
+        vx, vy, fusion, dst, (uint32_t) ncols_x, (uint32_t) nrows_x);
+}
+
+// Returns true if the Hopper Q6_K streaming kernel handled the multiplication.
+static bool mul_mat_vec_q6_K_tma_try(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_row_x,
+        const int nchannels_x, const int nchannels_dst, const int nsamples_x, const int nsamples_dst, cudaStream_t stream) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // GGML_CUDA_MMVQ_Q6K_TMA: 0 off, 1 (default) on Hopper, 2 also on newer archs (bulk copies exist from sm_90 on)
+    static const int mode = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_Q6K_TMA");
+        return env == nullptr ? 1 : atoi(env);
+    }();
+    if (mode == 0) {
+        return false;
+    }
+    const int device = ggml_cuda_get_device();
+    const int cc     = ggml_cuda_info().devices[device].cc;
+    const bool hopper = cc >= GGML_CUDA_CC_HOPPER && cc < GGML_CUDA_CC_HOPPER + 100;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_HOPPER || (!hopper && mode < 2) ||
+            ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_HOPPER) {
+        return false;
+    }
+    // plain 2D matrix times one column; small matrices do not amortize the persistent grid (measured below 2048 rows)
+    if (ncols_dst != 1 || ids != nullptr || nchannels_x != 1 || nchannels_dst != 1 || nsamples_x != 1 || nsamples_dst != 1 ||
+            nrows_x < 2048 || fusion.shared_up != nullptr || fusion.x_scale != nullptr || fusion.gate_scale != nullptr) {
+        return false;
+    }
+    const int blocks_per_row_x = ncols_x / QK_K;
+    if (stride_row_x != blocks_per_row_x) {
+        return false;
+    }
+    // a tile of R rows has to be a multiple of 16 bytes for cp.async.bulk
+    const size_t row_bytes = (size_t) blocks_per_row_x * sizeof(block_q6_K);
+    const int R = (2*row_bytes) % 16 == 0 ? 2 : ((4*row_bytes) % 16 == 0 ? 4 : 0);
+    if (R == 0 || nrows_x % R != 0) {
+        return false;
+    }
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const bool two_tiles  = fusion.gate != nullptr;
+    if ((uintptr_t) vx % 16 != 0 || (uintptr_t) vy % 16 != 0 || (two_tiles && (uintptr_t) fusion.gate % 16 != 0)) {
+        return false;
+    }
+    if (has_fusion && !two_tiles) {
+        return false; // bias-only fusion keeps the stock path, the kernel always streams a gate tile when fused
+    }
+    // in the server the fused gate/up (shared expert) came out slower than stock (5.70 vs 5.40 ms per K3 token,
+    // op profile), the plain GEMVs faster (19.2 vs 20.8 ms): fused launches keep the stock kernel unless asked for
+    static const bool fused_too = getenv("GGML_CUDA_MMVQ_Q6K_TMA_FUSED") != nullptr && atoi(getenv("GGML_CUDA_MMVQ_Q6K_TMA_FUSED")) != 0;
+    if (has_fusion && !fused_too) {
+        return false;
+    }
+    const size_t tile_stride = (R*row_bytes + 127) & ~(size_t) 127;
+    const size_t smem = MMVQ_Q6K_TMA_STAGES*(two_tiles ? 2 : 1)*tile_stride + (size_t) (ncols_x/QK8_1)*sizeof(block_q8_1);
+    const size_t smem_budget = std::min<size_t>(MMVQ_Q6K_TMA_MAX_SMEM, ggml_cuda_info().devices[device].smpbo - 1024); // room for the static part
+    if (smem > smem_budget) {
+        return false;
+    }
+    const int blocks_per_sm = std::max<int>(1, std::min<int>(4, smem_budget / smem));
+    const int ntiles = nrows_x / R;
+    const dim3 block_nums(std::min(ntiles, ggml_cuda_info().devices[device].nsm * blocks_per_sm), 1, 1);
+    const dim3 block_dims(WARP_SIZE, MMVQ_Q6K_TMA_NWARPS, 1);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, smem, stream);
+
+    if (R == 2) {
+        if (has_fusion) {
+            mul_mat_vec_q6_K_tma_launch<2, true>(launch_params, vx, vy, fusion, dst, ncols_x, nrows_x);
+        } else {
+            mul_mat_vec_q6_K_tma_launch<2, false>(launch_params, vx, vy, fusion, dst, ncols_x, nrows_x);
+        }
+    } else {
+        if (has_fusion) {
+            mul_mat_vec_q6_K_tma_launch<4, true>(launch_params, vx, vy, fusion, dst, ncols_x, nrows_x);
+        } else {
+            mul_mat_vec_q6_K_tma_launch<4, false>(launch_params, vx, vy, fusion, dst, ncols_x, nrows_x);
+        }
+    }
+    return true;
+#else
+    GGML_UNUSED_VARS(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x,
+                     nchannels_x, nchannels_dst, nsamples_x, nsamples_dst, stream);
+    return false;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
 static void mul_mat_vec_q_switch_type(
         const void * vx, const ggml_type type_x, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const int ncols_x, const int nrows_x, const int ncols_dst,
@@ -1388,6 +1725,10 @@ static void mul_mat_vec_q_switch_type(
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
             break;
         case GGML_TYPE_Q6_K:
+            if (mul_mat_vec_q6_K_tma_try(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x,
+                                         nchannels_x, nchannels_dst, nsamples_x, nsamples_dst, stream)) {
+                break;
+            }
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q6_K>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,

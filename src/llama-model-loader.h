@@ -107,6 +107,13 @@ struct llama_model_loader {
             return it == ranges.end() ? none : it->second;
         }
 
+        // kimi-k3-spark patch 0003: keep a tensor's bytes out of the prefetch of its mapping without making it
+        // lazy (the bytes are read elsewhere, from the expert store); the mapping then skips MAP_POPULATE and
+        // advises WILLNEED on everything else and RANDOM on these ranges
+        void exclude_prefetch(const llama_tensor_weight & w, const ggml_tensor * t) {
+            ranges[w.idx].emplace_back(w.offs, w.offs + ggml_nbytes(t));
+        }
+
         // lazy tensors are gathered on the host, so no offload setting applies to them
         static ggml_backend_buffer_type_t buft();
 

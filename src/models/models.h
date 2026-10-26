@@ -2801,6 +2801,11 @@ struct llama_model_kimi_k3 : public llama_model_base {
 
         // Cross-layer residual attention (K3's `_apply_attn_res`).
         ggml_tensor * resi_stack = nullptr;
+        ggml_tensor * last_sh    = nullptr; // the shared expert output of the layer just built (prefetch predictor)
+        ggml_tensor * pred_ps_attn = nullptr; // the residual stream before the current layer's FFN (prefetch predictor)
+        // extra: an estimate of this layer's routed output (the resident experts' share, predictor input 3)
+        ggml_tensor * build_prefetch_input2(ggml_tensor * sh, int il_next, int64_t n_tokens, ggml_tensor * extra = nullptr);
+        ggml_tensor * res_mix_pred(ggml_tensor * cur, ggml_tensor * score_w, ggml_tensor * extra_ckpt, int64_t n_tokens);
 
         void          res_push(ggml_tensor * cur, int64_t n_embd, int64_t n_tokens);
         ggml_tensor * res_mix(ggml_tensor * cur, ggml_tensor * score_w,
@@ -2818,7 +2823,7 @@ struct llama_model_kimi_k3 : public llama_model_base {
                                       int64_t kv_lora_rank, int64_t n_embd_head_qk_rope,
                                       int64_t n_embd_head_qk_nope, float kq_scale, int il);
 
-        ggml_tensor * build_latent_moe(ggml_tensor * cur, const llama_layer & layer,
+        ggml_tensor * build_latent_moe(ggml_tensor * cur, ggml_tensor * inp_raw, const llama_layer & layer,
                                        int64_t n_embd_latent, int il);
     };
 

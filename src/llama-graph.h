@@ -1059,6 +1059,24 @@ struct llm_graph_context {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
 
+    // kimi-k3-spark patch 0003: nodes that do not need the routed experts of the layer being built; with self-prefetch
+    // build_moe_cache_slots expands them between the early post of the real ids and the real lookup
+    mutable std::vector<ggml_tensor *> moe_overlap;
+    // kimi-k3-spark patch 0003: the predictive-prefetch post of the next layer, built by build_moe_cache_prefetch and
+    // expanded by build_moe_cache_slots right after the real lookup, where the drive goes idle
+    mutable ggml_tensor * moe_prefetch_node = nullptr;
+    // kimi-k3-spark patch 0003: split expert GEMV (see llama_moe_cache::split_enabled). build_moe_cache_slots returns
+    // the early ids (n_expert_used + 1, the last one the zero record) and leaves here the real lookup (not expanded
+    // yet), the merge rows and the prefetch post to expand behind the real lookup; build_moe_ffn consumes them.
+    mutable ggml_tensor * moe_split_late  = nullptr;
+    mutable ggml_tensor * moe_split_merge = nullptr;
+    mutable ggml_tensor * moe_split_pf    = nullptr;
+    mutable bool          moe_split_bank  = false; // build_lora_mm_id: index the bank with the zero record included
+    mutable bool          moe_split_allowed = false; // set by build_moe_ffn around build_moe_cache_slots
+    // set by the model for one build_moe_ffn: given the weighted sum of the early output's rows (the resident
+    // experts' share of the routed output, [n_embd, n_tokens]), builds the next layer's prefetch post and returns it
+    mutable std::function<ggml_tensor * (ggml_tensor *)> moe_split_partial_cb;
+
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
@@ -1222,6 +1240,20 @@ struct llm_graph_context {
              ggml_tensor * down_exps,
              ggml_tensor * gate_up_exps,
                      int   il) const;
+
+    // kimi-k3-spark patch 0003: predictive prefetch of layer il_next's experts (the MoE cache reads the predicted
+    // misses while the GPU works on the current layer). router_in is the current layer's router input, router_in_alt
+    // an optional better guess of the next layer's (used with LLAMA_EXPERT_STORE_PREFETCH_INPUT=1), gate_inp /
+    // exp_probs_b / gating_op those of layer il_next. Decode only, a no-op unless the cache has prefetch on. The post
+    // is only built here; build_moe_cache_slots of the current layer expands it right after the real lookup.
+    void build_moe_cache_prefetch(
+             ggml_tensor * router_in,
+             ggml_tensor * router_in_alt,
+             ggml_tensor * gate_inp,
+             ggml_tensor * exp_probs_b,
+                 int64_t   n_expert_used,
+   llama_expert_gating_func_type gating_op,
+                     int   il_next) const;
 
     //
     // inputs

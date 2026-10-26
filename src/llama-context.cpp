@@ -2748,6 +2748,9 @@ ggml_status llama_context::graph_compute(
     }
 
     copy_experts.reset();
+    if (moe_cache) {
+        moe_cache->prefill_reset();
+    }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -2801,6 +2804,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
 
         st.ids = ids;
+    }
+
+    // kimi-k3-spark patch 0003: with an expert store the records are read into pinned staging and uploaded from there
+    if (lctx->moe_cache && lctx->moe_cache->fill_prefill(backend, src, dst, ids, st.used)) {
+        return true;
     }
 
     // the experts live in host memory, usually a memory-mapped file: advise the kernel about

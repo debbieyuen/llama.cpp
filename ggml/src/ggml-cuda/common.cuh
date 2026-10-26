@@ -1178,6 +1178,7 @@ struct ggml_cuda_device_info {
         size_t  smpbo;                          // max. shared memory per block (with opt-in)
         bool    integrated;                     // Device is integrated as opposed to discrete
         bool    zero_copy_host;                 // kernels may read memory-mapped host weights in place (GGML_CUDA_HOST_ZERO_COPY)
+        bool    host_bank;                      // kernels may read registered host memory in place (integrated device, host pointers usable)
         bool    vmm;                            // virtual memory support
         size_t  vmm_granularity;                // granularity of virtual memory
         size_t  total_vram;

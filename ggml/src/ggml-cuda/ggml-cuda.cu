@@ -75,6 +75,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <thread>
+#ifdef __linux__
+#include <sched.h>
+#endif
 #include <charconv>
 #include <cinttypes>
 #include <condition_variable>
@@ -467,6 +472,22 @@ static ggml_cuda_device_info ggml_cuda_init() {
             info.devices[id].zero_copy_host = prop.integrated && pageable && host_pt;
             GGML_LOG_INFO("%s: device %d: zero-copy host weights %s (integrated = %d, pageable access = %d, host page tables = %d)\n",
                 __func__, id, info.devices[id].zero_copy_host ? "enabled" : "not available", (int) prop.integrated, pageable, host_pt);
+        }
+        info.devices[id].host_bank = false;
+        {
+            // kernels read registered host memory in place where the fabric makes that fast: an integrated device
+            // (GB10) or a discrete one whose pageable access goes through the host page tables (Grace Hopper's
+            // NVLink-C2C); a PCIe device with HMM has the pointer but not the bandwidth
+            int host_ptr = 0;
+            int pageable = 0;
+            int host_pt  = 0;
+            CUDA_CHECK(cudaDeviceGetAttribute(&host_ptr, cudaDevAttrCanUseHostPointerForRegisteredMem, physical_id));
+            CUDA_CHECK(cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, physical_id));
+            CUDA_CHECK(cudaDeviceGetAttribute(&host_pt,  cudaDevAttrPageableMemoryAccessUsesHostPageTables, physical_id));
+            const bool coherent = prop.integrated || (pageable && host_pt);
+            info.devices[id].host_bank = host_ptr && (coherent || ggml_cuda_env_flag("GGML_CUDA_FORCE_HOST_BANK")) && !ggml_cuda_env_flag("GGML_CUDA_NO_HOST_BANK");
+            GGML_LOG_INFO("%s: device %d: host bank %s (integrated = %d, host pointer for registered memory = %d, pageable access = %d, host page tables = %d)\n",
+                __func__, id, info.devices[id].host_bank ? "enabled" : "not available", (int) prop.integrated, host_ptr, pageable, host_pt);
         }
 #endif
         info.devices[id].nsm        = prop.multiProcessorCount;
@@ -1495,6 +1516,467 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
 //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 //}
+
+// host bank buffer type: caller-owned host memory registered with the driver, which the kernels of an integrated
+// device read in place (no copy, no page faults). Used by llama.cpp's expert store for its host-RAM expert cache,
+// so the expert matmuls of a small batch run on the GPU straight from the cache the CPU fills from the NVMe.
+
+static const char * ggml_backend_cuda_host_bank_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    return GGML_CUDA_NAME "_HostBank";
+
+    GGML_UNUSED(buft);
+}
+
+static bool ggml_backend_buft_is_cuda_host_bank(ggml_backend_buffer_type_t buft) {
+    return buft->iface.get_name == ggml_backend_cuda_host_bank_buffer_type_name;
+}
+
+static void ggml_backend_cuda_host_bank_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    // the memory stays with its owner, only the registration goes
+    cudaError_t err = cudaHostUnregister(buffer->context);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+    }
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_host_bank_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    GGML_UNUSED(buft);
+    GGML_UNUSED(size);
+    GGML_ABORT("the host bank buffer type wraps caller memory, use ggml_backend_cuda_host_bank_buffer_from_ptr");
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_host_bank_buffer_type() {
+    static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_host_bank = {
+        /* .iface    = */ {
+            /* .get_name            = */ ggml_backend_cuda_host_bank_buffer_type_name,
+            /* .alloc_buffer        = */ ggml_backend_cuda_host_bank_buffer_type_alloc_buffer,
+            /* .alloc_buffer_n      = */ NULL,
+            /* .get_alignment       = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+            /* .get_max_size        = */ NULL,
+            /* .get_alloc_size      = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+            /* .get_alloc_size_n    = */ NULL,
+            /* .is_host             = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+        },
+        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0),
+        /* .context  = */ nullptr,
+    };
+
+    return &ggml_backend_cuda_buffer_type_host_bank;
+}
+
+// kimi-k3-spark patch 0003: a host callback before GET_ROWS of a host-bank tensor (the MoE cache's slot maps). The
+// cache reads the selected experts from its store into the registered bank before the lookup and the matmul run, so
+// the whole graph stays on the GPU (one split) instead of a CPU split per layer for the lookup.
+static ggml_backend_cuda_host_bank_hook_t g_host_bank_hook    = nullptr;
+static void *                             g_host_bank_hook_ud = nullptr;
+
+// Asynchronous variant (GGML_CUDA_HOST_BANK_ASYNC, default on where the driver API is linked): instead of
+// synchronizing the stream before each lookup, the GPU itself writes the selected experts to a mailbox in mapped
+// host memory and waits on a flag (cuStreamWaitValue32); a CPU thread spinning on the mailbox runs the hook and sets
+// the flag. Nothing on the stream blocks the host, so the graph stays capturable and a decode token replays as one
+// CUDA graph instead of ~18k individual launches. One mailbox per stream of the context.
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#define GGML_CUDA_HOST_BANK_ASYNC_SUPPORTED
+#endif
+
+#define GGML_CUDA_BANK_MAILBOX_IDS 65536
+
+// What goes through the mailbox is read by the poller when the GPU gets to the request, which with eager launches
+// (no CUDA graph: batches of more than one token) can be long after the host launched it, and after the host has
+// moved on to the next ubatch of the same decode and rebuilt the scheduler's graph in the same memory. So nothing
+// in it may point into the graph: the slot map (a tensor owned by the MoE cache) and the kind of lookup go by
+// value. Passing the lookup node itself made the poller read a tensor of the next graph, fill the wrong layer or
+// none, and the lookup then read -1 as an expert slot (two sequences decoding together on the GH200).
+struct ggml_cuda_bank_mailbox {
+    volatile uint32_t req;      // set to 1 by the GPU once ids/slot_map/kind/n_ids are written
+    volatile uint32_t done;     // set to 1 by the poller after the hook; reset to 0 by the GPU after its wait
+    volatile uint64_t slot_map; // const ggml_tensor * src0 of the lookup (the cache's slot map, outlives the graph)
+    volatile uint32_t kind;     // GGML_CUDA_HOST_BANK_LOOKUP / _PREDICT / _SELF
+    volatile int64_t  n_ids;
+    int32_t           ids[GGML_CUDA_BANK_MAILBOX_IDS];
+};
+
+static int ggml_cuda_host_bank_kind(const ggml_tensor * node) {
+    if (strncmp(node->name, "moe_prefetch_self", 17) == 0) {
+        return GGML_CUDA_HOST_BANK_SELF;
+    }
+    if (strncmp(node->name, "moe_prefetch", 12) == 0) {
+        return GGML_CUDA_HOST_BANK_PREDICT;
+    }
+    return GGML_CUDA_HOST_BANK_LOOKUP;
+}
+
+static ggml_cuda_bank_mailbox * g_bank_mb   = nullptr; // host view, GGML_CUDA_MAX_STREAMS of them
+static ggml_cuda_bank_mailbox * g_bank_mb_d = nullptr; // device view
+static std::thread              g_bank_poller;
+static std::atomic<bool>        g_bank_poller_stop{false};
+static std::atomic<uint64_t>    g_bank_async_requests{0};
+
+static bool ggml_cuda_host_bank_async_enabled() {
+#ifdef GGML_CUDA_HOST_BANK_ASYNC_SUPPORTED
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_HOST_BANK_ASYNC"); return !(e != nullptr && e[0] == '0'); }();
+    return enabled && g_bank_mb != nullptr;
+#else
+    return false;
+#endif
+}
+
+// kimi-k3-spark patch 0003: the poller is on every layer's critical path (it answers the GPU's lookups), so it
+// honours LLAMA_EXPERT_STORE_CPUS (a cpu list such as 0-9 or 0,2,4-7) like the expert store's own threads
+// (src/llama-moe-cache.cpp store_cpu_set); the backend cannot call into llama, hence the second small parser.
+static void ggml_cuda_bank_poller_pin() {
+#ifdef __linux__
+    const char * env = getenv("LLAMA_EXPERT_STORE_CPUS");
+    if (env == nullptr || env[0] == 0) {
+        return;
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    int n = 0;
+    for (const char * p = env; *p; ) {
+        char * end = nullptr;
+        long a = strtol(p, &end, 10);
+        long b = a;
+        if (end == p) {
+            break;
+        }
+        p = end;
+        if (*p == '-') {
+            b = strtol(p + 1, &end, 10);
+            p = end;
+        }
+        for (long c = a; c <= b && c >= 0 && c < CPU_SETSIZE; ++c) {
+            CPU_SET((int) c, &set);
+            n++;
+        }
+        while (*p == ',' || *p == ' ') {
+            p++;
+        }
+    }
+    if (n > 0 && sched_setaffinity(0, sizeof(set), &set) != 0) {
+        GGML_LOG_WARN("%s: sched_setaffinity failed, the host-bank poller is not pinned\n", __func__);
+    }
+#endif
+}
+
+static void ggml_cuda_bank_poller_main() {
+    ggml_cuda_bank_poller_pin();
+    int idle = 0;
+    while (!g_bank_poller_stop.load(std::memory_order_relaxed)) {
+        bool served = false;
+        // real lookups first: the GPU is waiting on them
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            ggml_cuda_bank_mailbox * mb = &g_bank_mb[s];
+            if (mb->req != 1) {
+                continue;
+            }
+            mb->req = 0;
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (g_host_bank_hook != nullptr) {
+                g_host_bank_hook(g_host_bank_hook_ud, (const ggml_tensor *) (uintptr_t) mb->slot_map, (int) mb->kind, (const int32_t *) mb->ids, (int64_t) mb->n_ids);
+            }
+            std::atomic_thread_fence(std::memory_order_seq_cst); // the fills and the slot map before the flag
+            mb->done = 1;
+            served = true;
+        }
+        if (served) {
+            idle = 0;
+            continue;
+        }
+        // then predictions (posted without a wait, mailboxes GGML_CUDA_MAX_STREAMS..2*GGML_CUDA_MAX_STREAMS-1); a torn
+        // read while the GPU posts the next one only yields other valid expert ids, a wasted read at worst
+        for (int s = GGML_CUDA_MAX_STREAMS; s < 2*GGML_CUDA_MAX_STREAMS; ++s) {
+            ggml_cuda_bank_mailbox * mb = &g_bank_mb[s];
+            if (mb->req != 1) {
+                continue;
+            }
+            mb->req = 0;
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (g_host_bank_hook != nullptr) {
+                g_host_bank_hook(g_host_bank_hook_ud, (const ggml_tensor *) (uintptr_t) mb->slot_map, (int) mb->kind, (const int32_t *) mb->ids, (int64_t) mb->n_ids);
+            }
+            served = true;
+            break; // back to the real mailboxes
+        }
+        if (served) {
+            idle = 0;
+        } else if (++idle > 200000) {
+            // nothing for a while (no decode running): stop burning a core, wake up every 200 us
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    }
+}
+
+void ggml_backend_cuda_set_host_bank_hook(ggml_backend_cuda_host_bank_hook_t fn, void * user_data) {
+#ifdef GGML_CUDA_HOST_BANK_ASYNC_SUPPORTED
+    if (fn == nullptr && g_bank_poller.joinable()) {
+        g_bank_poller_stop = true;
+        g_bank_poller.join();
+    }
+#endif
+    g_host_bank_hook    = fn;
+    g_host_bank_hook_ud = user_data;
+#ifdef GGML_CUDA_HOST_BANK_ASYNC_SUPPORTED
+    const char * e = getenv("GGML_CUDA_HOST_BANK_ASYNC");
+    if (fn != nullptr && !(e != nullptr && e[0] == '0')) {
+        if (g_bank_mb == nullptr) {
+            void * p = nullptr;
+            if (cudaHostAlloc(&p, sizeof(ggml_cuda_bank_mailbox)*2*GGML_CUDA_MAX_STREAMS, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
+                memset(p, 0, sizeof(ggml_cuda_bank_mailbox)*2*GGML_CUDA_MAX_STREAMS);
+                void * d = nullptr;
+                if (cudaHostGetDevicePointer(&d, p, 0) == cudaSuccess) {
+                    g_bank_mb   = (ggml_cuda_bank_mailbox *) p;
+                    g_bank_mb_d = (ggml_cuda_bank_mailbox *) d;
+                } else {
+                    cudaFreeHost(p);
+                    (void) cudaGetLastError();
+                }
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
+        if (g_bank_mb != nullptr && !g_bank_poller.joinable()) {
+            g_bank_poller_stop = false;
+            g_bank_poller = std::thread(ggml_cuda_bank_poller_main);
+        }
+        GGML_LOG_INFO("%s: host bank hook: %s\n", __func__, g_bank_mb != nullptr ?
+            "asynchronous (GPU-side wait on a mapped mailbox, CUDA graphs stay on)" : "synchronous (mailbox allocation failed)");
+    }
+#endif
+}
+
+#ifdef GGML_CUDA_HOST_BANK_ASYNC_SUPPORTED
+static __global__ void k_bank_request(const int32_t * __restrict__ ids, const int64_t n, ggml_cuda_bank_mailbox * mb, const uint64_t slot_map, const uint32_t kind) {
+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+        mb->ids[i] = ids[i];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        mb->slot_map = slot_map;
+        mb->kind     = kind;
+        mb->n_ids    = n;
+        __threadfence_system();
+        mb->req = 1;
+        __threadfence_system();
+    }
+}
+
+// the GPU side of the handshake: publish the ids, wait for the poller, reset the flag
+static void ggml_cuda_host_bank_request_async(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+    const ggml_tensor * ids = node->src[1];
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids) && ids->data != nullptr);
+    const int64_t n = ggml_nelements(ids);
+    GGML_ASSERT(n <= GGML_CUDA_BANK_MAILBOX_IDS);
+    const int s = ctx.curr_stream_no;
+    GGML_ASSERT(s >= 0 && s < GGML_CUDA_MAX_STREAMS);
+    cudaStream_t stream = ctx.stream();
+    const uint64_t slot_map = (uint64_t) (uintptr_t) node->src[0]; // read now: the node may be gone when the GPU gets here
+    const int kind = ggml_cuda_host_bank_kind(node);
+    if (kind != GGML_CUDA_HOST_BANK_LOOKUP) {
+        // a prediction or an early post: post it and go on, nothing waits for it
+        k_bank_request<<<1, 256, 0, stream>>>((const int32_t *) ids->data, n, &g_bank_mb_d[GGML_CUDA_MAX_STREAMS + s], slot_map, (uint32_t) kind);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    k_bank_request<<<1, 256, 0, stream>>>((const int32_t *) ids->data, n, &g_bank_mb_d[s], slot_map, (uint32_t) kind);
+    CUDA_CHECK(cudaGetLastError());
+    const CUdeviceptr done = (CUdeviceptr) (uintptr_t) &g_bank_mb_d[s].done;
+    CU_CHECK(cuStreamWaitValue32((CUstream) stream, done, 1, CU_STREAM_WAIT_VALUE_EQ));
+    CU_CHECK(cuStreamWriteValue32((CUstream) stream, done, 0, CU_STREAM_WRITE_VALUE_DEFAULT));
+    g_bank_async_requests++;
+}
+#endif
+
+static bool ggml_cuda_host_bank_hook_node(const ggml_tensor * node) {
+    return g_host_bank_hook != nullptr && node->op == GGML_OP_GET_ROWS && node->src[0] != nullptr &&
+        node->src[0]->buffer != nullptr && ggml_backend_buft_is_cuda_host_bank(node->src[0]->buffer->buft) &&
+        strncmp(node->name, "moe_nowait", 10) != 0; // a map the hook already filled (the split GEMV's merge rows): plain read
+}
+
+// GGML_CUDA_HOST_BANK_CHECK=1 (diagnostics, kimi-k3-spark patch 0003): after every real bank lookup a kernel validates
+// the slot indices it produced (0 <= s < 1<<20) and records the first bad one in a mapped word; the end of the graph
+// synchronizes and reports it together with the lookup node. Tells a stale or torn slot map from a fault elsewhere.
+struct ggml_cuda_bank_check {
+    volatile uint32_t flag;
+    int32_t  idx;
+    int32_t  val;
+    uint64_t node;
+    uint32_t n;
+};
+static ggml_cuda_bank_check * g_bank_check   = nullptr;
+static ggml_cuda_bank_check * g_bank_check_d = nullptr;
+
+static bool ggml_cuda_host_bank_check_enabled() {
+    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_HOST_BANK_CHECK");
+    return enabled;
+}
+
+static __global__ void k_bank_check(const int32_t * __restrict__ s, const int64_t n, const uint64_t node, ggml_cuda_bank_check * out) {
+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const int32_t v = s[i];
+        if (v < 0 || v >= (1 << 20)) {
+            if (atomicCAS((unsigned int *) &out->flag, 0u, 1u) == 0u) {
+                out->idx  = (int32_t) i;
+                out->val  = v;
+                out->node = node;
+                out->n    = (uint32_t) n;
+                __threadfence_system();
+            }
+        }
+    }
+}
+
+static void ggml_cuda_host_bank_check_node(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+    if (node->type != GGML_TYPE_I32 || strncmp(node->name, "moe_prefetch", 12) == 0) {
+        return; // a prediction post: its lookup output is unused and may hold -1
+    }
+    if (g_bank_check == nullptr) {
+        void * p = nullptr;
+        CUDA_CHECK(cudaHostAlloc(&p, sizeof(ggml_cuda_bank_check), cudaHostAllocMapped | cudaHostAllocPortable));
+        memset(p, 0, sizeof(ggml_cuda_bank_check));
+        void * d = nullptr;
+        CUDA_CHECK(cudaHostGetDevicePointer(&d, p, 0));
+        g_bank_check   = (ggml_cuda_bank_check *) p;
+        g_bank_check_d = (ggml_cuda_bank_check *) d;
+        GGML_LOG_INFO("%s: host bank check: on (every lookup's slot indices are validated on the GPU)\n", __func__);
+    }
+    k_bank_check<<<1, 256, 0, ctx.stream()>>>((const int32_t *) node->data, ggml_nelements(node), (uint64_t) (uintptr_t) node, g_bank_check_d);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void ggml_cuda_host_bank_check_report(ggml_backend_cuda_context & ctx) {
+    if (g_bank_check == nullptr) {
+        return;
+    }
+    const cudaError_t err = cudaStreamSynchronize(ctx.stream());
+    if (g_bank_check->flag != 0) {
+        const ggml_tensor * node = (const ggml_tensor *) (uintptr_t) g_bank_check->node;
+        GGML_LOG_ERROR("%s: host bank check: lookup %s produced slot %d at index %d of %u (src1 %s [%lld,%lld])\n", __func__,
+            node->name, g_bank_check->val, g_bank_check->idx, g_bank_check->n,
+            node->src[1] ? node->src[1]->name : "-", node->src[1] ? (long long) node->src[1]->ne[0] : 0LL, node->src[1] ? (long long) node->src[1]->ne[1] : 0LL);
+        g_bank_check->flag = 0;
+    }
+    if (err != cudaSuccess) {
+        GGML_LOG_ERROR("%s: host bank check: the graph ended with %s\n", __func__, cudaGetErrorString(err));
+        CUDA_CHECK(err);
+    }
+}
+
+// synchronizes the stream, reads the ids back and calls the hook; the kernels launched after it see the filled bank
+static void ggml_cuda_host_bank_call_hook(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+    const ggml_tensor * ids = node->src[1];
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids) && ids->data != nullptr);
+    static thread_local std::vector<int32_t> ids_host;
+    const int64_t n = ggml_nelements(ids);
+    ids_host.resize((size_t) n);
+    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, (size_t) n*sizeof(int32_t), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    g_host_bank_hook(g_host_bank_hook_ud, node->src[0], ggml_cuda_host_bank_kind(node), ids_host.data(), n);
+}
+
+// GGML_CUDA_OP_PROFILE=N: time every node with CUDA events and print the GPU time per op kind every N graphs
+// (kimi-k3-spark patch 0003; no Nsight on the boxes). The key separates weights in host memory (a host bank,
+// read over C2C / the unified fabric) from device weights. Time between a node's begin and end events includes any
+// host work done in between (the host bank hook's fills are charged to the slot-map GET_ROWS).
+struct ggml_cuda_op_profile_entry { std::string key; cudaEvent_t beg; cudaEvent_t end; };
+static int ggml_cuda_op_profile_every() {
+    static const int every = [] { const char * e = getenv("GGML_CUDA_OP_PROFILE"); return e ? atoi(e) : 0; }();
+    return every;
+}
+static std::vector<ggml_cuda_op_profile_entry> g_op_prof_pending;
+static std::vector<cudaEvent_t>                g_op_prof_free;
+static std::map<std::string, std::pair<double, int64_t>> g_op_prof_total; // key -> (ms, count)
+static int     g_op_prof_graphs = 0;
+static cudaEvent_t g_op_prof_cur_beg = nullptr;
+
+static cudaEvent_t ggml_cuda_op_profile_event() {
+    if (!g_op_prof_free.empty()) {
+        cudaEvent_t e = g_op_prof_free.back();
+        g_op_prof_free.pop_back();
+        return e;
+    }
+    cudaEvent_t e;
+    CUDA_CHECK(cudaEventCreate(&e));
+    return e;
+}
+
+static void ggml_cuda_op_profile_begin(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+    GGML_UNUSED(node);
+    if (ggml_cuda_op_profile_every() <= 0) {
+        return;
+    }
+    g_op_prof_cur_beg = ggml_cuda_op_profile_event();
+    CUDA_CHECK(cudaEventRecord(g_op_prof_cur_beg, ctx.stream()));
+}
+
+static void ggml_cuda_op_profile_end(ggml_backend_cuda_context & ctx, const ggml_tensor * node, bool fused) {
+    if (ggml_cuda_op_profile_every() <= 0 || g_op_prof_cur_beg == nullptr) {
+        return;
+    }
+    cudaEvent_t end = ggml_cuda_op_profile_event();
+    CUDA_CHECK(cudaEventRecord(end, ctx.stream()));
+    std::string key = fused ? std::string("fused:") + ggml_op_name(node->op) : std::string(ggml_op_name(node->op));
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_GET_ROWS) {
+        const ggml_tensor * w = node->src[0];
+        const bool host = w != nullptr && w->buffer != nullptr && ggml_backend_buft_is_cuda_host_bank(w->buffer->buft);
+        key += std::string(host ? " [host] " : " [dev] ") + (w ? ggml_type_name(w->type) : "?");
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            key += " n_tok=" + std::to_string(node->src[1] ? node->src[1]->ne[2] : 0);
+        }
+    }
+    g_op_prof_pending.push_back({ key, g_op_prof_cur_beg, end });
+    g_op_prof_cur_beg = nullptr;
+}
+
+static void ggml_cuda_op_profile_flush(ggml_backend_cuda_context & ctx) {
+    if (ggml_cuda_op_profile_every() <= 0 || g_op_prof_pending.empty()) {
+        return;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    for (auto & p : g_op_prof_pending) {
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, p.beg, p.end));
+        auto & t = g_op_prof_total[p.key];
+        t.first += ms;
+        t.second++;
+        g_op_prof_free.push_back(p.beg);
+        g_op_prof_free.push_back(p.end);
+    }
+    g_op_prof_pending.clear();
+    if (++g_op_prof_graphs % ggml_cuda_op_profile_every() != 0) {
+        return;
+    }
+    std::vector<std::pair<std::string, std::pair<double, int64_t>>> rows(g_op_prof_total.begin(), g_op_prof_total.end());
+    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
+    double total = 0.0;
+    for (auto & r : rows) {
+        total += r.second.first;
+    }
+    GGML_LOG_INFO("op profile over %d graphs: %.1f ms of node time per graph\n", g_op_prof_graphs, total/g_op_prof_graphs);
+    for (size_t k = 0; k < rows.size() && k < 24; ++k) {
+        GGML_LOG_INFO("  %6.2f ms/graph %5.1f%%  %7.1f us/call  %6lld calls/graph  %s\n",
+            rows[k].second.first/g_op_prof_graphs, 100.0*rows[k].second.first/total,
+            1000.0*rows[k].second.first/rows[k].second.second, (long long) (rows[k].second.second/g_op_prof_graphs), rows[k].first.c_str());
+    }
+    g_op_prof_total.clear();
+    g_op_prof_graphs = 0;
+}
+
+ggml_backend_buffer_t ggml_backend_cuda_host_bank_buffer_from_ptr(void * ptr, size_t size) {
+    if (!ggml_cuda_info().devices[0].host_bank) {
+        return nullptr;
+    }
+    cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        GGML_LOG_WARN("%s: failed to register %.2f MiB of host memory: %s\n", __func__, size/1024.0/1024.0, cudaGetErrorString(err));
+        return nullptr;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft = ggml_backend_cuda_host_bank_buffer_type();
+    buffer->iface.free_buffer = ggml_backend_cuda_host_bank_buffer_free_buffer;
+    return buffer;
+}
 
 /// kernels
 
@@ -2846,6 +3328,14 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 }
             }
         }
+        if ((ggml_cuda_host_bank_hook_node(node) && !ggml_cuda_host_bank_async_enabled()) || ggml_cuda_op_profile_every() > 0) {
+            // the MoE cache fills its bank on the host right before the lookup, which cannot be captured
+            // (and the op profiler times nodes with events between them)
+            use_cuda_graph = false;
+            if (ggml_cuda_graph_debug_enabled()) {
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to the host bank hook\n", __func__);
+            }
+        }
 
         if (!use_cuda_graph) {
             break;
@@ -2895,6 +3385,12 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            if (!res && ggml_cuda_env_flag("GGML_CUDA_GRAPH_STATS")) {
+                static int n_logged = 0;
+                if (n_logged++ < 40) {
+                    GGML_LOG_INFO("%s: graph changed at node %d/%d %s (%s)\n", __func__, i, cgraph->n_nodes, cgraph->nodes[i]->name, ggml_op_name(cgraph->nodes[i]->op));
+                }
+            }
             graph->node_props[i] = prop;
             res = true;
         }
@@ -4787,7 +5283,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                ggml_cuda_op_profile_begin(*cuda_ctx, node);
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                if (nodes_to_skip != 0) {
+                    ggml_cuda_op_profile_end(*cuda_ctx, node, true);
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -4809,7 +5309,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
-                               (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
+                               (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)) ||
+                               ggml_backend_buft_is_cuda_host_bank(node->src[j]->buffer->buft) ||
+                               ggml_cuda_host_zero_copy_buft(cuda_ctx->device, node->src[j]->buffer->buft));
                     }
                 }
 #else
@@ -4819,12 +5321,38 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (ggml_cuda_host_zero_copy_node(cuda_ctx->device, node)) {
                     ggml_cuda_host_prefetch_mul_mat_id(*cuda_ctx, node);
                 }
+                if (ggml_cuda_host_bank_hook_node(node)) {
+#ifdef GGML_CUDA_HOST_BANK_ASYNC_SUPPORTED
+                    if (ggml_cuda_host_bank_async_enabled()) {
+                        ggml_cuda_host_bank_request_async(*cuda_ctx, node);
+                    } else
+#endif
+                    {
+                        ggml_cuda_host_bank_call_hook(*cuda_ctx, node);
+                    }
+                }
 
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                ggml_cuda_op_profile_end(*cuda_ctx, node, false);
+                if (ggml_cuda_host_bank_check_enabled() && ggml_cuda_host_bank_hook_node(node)) {
+                    ggml_cuda_host_bank_check_node(*cuda_ctx, node);
+                }
+
+                // GGML_CUDA_DEBUG_SYNC=1: wait for every node, so a fault is reported with the node that raised it
+                static const bool debug_sync = ggml_cuda_env_flag("GGML_CUDA_DEBUG_SYNC");
+                if (debug_sync) {
+                    const cudaError_t err = cudaStreamSynchronize(cuda_ctx->stream());
+                    if (err != cudaSuccess) {
+                        GGML_LOG_ERROR("%s: node %d %s (%s) failed: %s; src0 %s [%lld,%lld,%lld] src1 %s\n", __func__, i, node->name, ggml_op_name(node->op), cudaGetErrorString(err),
+                            node->src[0] ? node->src[0]->name : "-", node->src[0] ? (long long) node->src[0]->ne[0] : 0LL, node->src[0] ? (long long) node->src[0]->ne[1] : 0LL, node->src[0] ? (long long) node->src[0]->ne[2] : 0LL,
+                            node->src[1] ? node->src[1]->name : "-");
+                        CUDA_CHECK(err);
+                    }
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4945,6 +5473,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    ggml_cuda_op_profile_flush(*cuda_ctx);
+    ggml_cuda_host_bank_check_report(*cuda_ctx);
+
+    // GGML_CUDA_GRAPH_STATS=1: how often a graph was replayed, captured or run node by node
+    if (ggml_cuda_env_flag("GGML_CUDA_GRAPH_STATS")) {
+        static int64_t n_total = 0, n_graph = 0, n_capture = 0, n_big = 0;
+        n_total++;
+        n_graph   += use_cuda_graph ? 1 : 0;
+        n_capture += (use_cuda_graph && cuda_graph_update_required) ? 1 : 0;
+        n_big     += cgraph->n_nodes > 1000 ? 1 : 0;
+        if (n_total % 200 == 0) {
+            GGML_LOG_INFO("%s: graphs %lld: %lld through CUDA graphs (%lld captures), %lld with >1000 nodes, last n_nodes %d\n", __func__,
+                (long long) n_total, (long long) n_graph, (long long) n_capture, (long long) n_big, cgraph->n_nodes);
+        }
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -6098,6 +6641,9 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
     if ((ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft))) {
         return true;
     }
+    if (ggml_backend_buft_is_cuda_host_bank(buft) && ggml_cuda_info().devices[dev_ctx->device].host_bank) {
+        return true;
+    }
     return ggml_cuda_host_zero_copy_buft(dev_ctx->device, buft);
 }
 
@@ -6266,6 +6812,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_host_bank_hook") == 0) {
+        return (void *)ggml_backend_cuda_set_host_bank_hook;
+    }
+    if (strcmp(name, "ggml_backend_cuda_host_bank_buffer_from_ptr") == 0) {
+        return (void *)ggml_backend_cuda_host_bank_buffer_from_ptr;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
