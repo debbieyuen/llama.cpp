@@ -2803,6 +2803,19 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         st.ids = ids;
     }
 
+    // the experts live in host memory, usually a memory-mapped file: advise the kernel about
+    // every selected expert before the uploads start, so their pages are read with large
+    // asynchronous I/Os instead of being faulted in one page at a time by the copies
+    if (src->buffer == nullptr || ggml_backend_buffer_is_host(src->buffer)) {
+        llama_memory_ranges mr;
+        for (int64_t e = 0; e < n_expert; e++) {
+            if (st.used[e]) {
+                mr.push_back({ (const uint8_t *) src->data + e*expert_size, expert_size });
+            }
+        }
+        llama_prefetch(std::move(mr));
+    }
+
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {
         if (!st.used[first]) {

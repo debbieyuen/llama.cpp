@@ -1,6 +1,7 @@
 #include "llama-moe-cache.h"
 
 #include "llama-impl.h"
+#include "llama-mmap.h"
 #include "llama-model.h"
 
 #include "ggml-cpp.h"
@@ -552,6 +553,23 @@ struct llama_moe_cache::impl {
         size_t n_hit = 0;
         if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+        }
+
+        // the experts live in host memory, usually a memory-mapped file: advise the kernel about
+        // the missing experts of every matrix of the layer before the uploads start, so their
+        // pages are read with large asynchronous I/Os instead of being faulted in one page at a
+        // time by the copies
+        if (!fills.empty()) {
+            llama_memory_ranges mr;
+            for (const ggml_tensor * w : l.experts) {
+                if (w->buffer != nullptr && !ggml_backend_buffer_is_host(w->buffer)) {
+                    continue;
+                }
+                for (const auto & f : fills) {
+                    mr.push_back({ (const uint8_t *) w->data + f.expert*w->nb[2], w->nb[2] });
+                }
+            }
+            llama_prefetch(std::move(mr));
         }
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together

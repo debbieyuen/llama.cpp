@@ -1733,6 +1733,18 @@ static void ggml_compute_forward_mul_mat_id(
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
     }
+
+#if defined(GGML_MMID_MADVISE) && defined(MADV_COLD)
+    // see ggml_graph_prefetch_mul_mat_id: the experts just used go to the front of the
+    // reclaim queue, so the page cache keeps the ones used least recently out
+    if (ith == 0 && ggml_mmid_cold_enabled() && src0->buffer != NULL && ggml_backend_buffer_is_host(src0->buffer)) {
+        for (int64_t cur_a = 0; cur_a < n_as; ++cur_a) {
+            if (matrix_row_counts[cur_a] > 0) {
+                ggml_mmid_madvise((const char *) src0->data + cur_a*nb02, nb02, MADV_COLD);
+            }
+        }
+    }
+#endif
 }
 
 /////////////////////////////////
@@ -3388,12 +3400,152 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
 
+// Prefetch of memory-mapped MoE experts.
+//
+// When the routed experts of a MoE model stay in a memory-mapped file (an
+// expert tensor larger than RAM, mapped with --load-mode mmap), the bytes of
+// an expert are only read from storage when GGML_OP_MUL_MAT_ID touches them.
+// Left to the compute threads that is one synchronous page fault per page,
+// and the kernel stops read-around on a mapping after a few hundred misses,
+// so every selected expert costs hundreds of serialized storage round trips.
+// Before a graph starts, advise the kernel about the whole slice of every
+// expert that the graph's MUL_MAT_ID nodes will read: the reads are issued
+// as large asynchronous I/Os that overlap with the compute of the earlier
+// experts. Only nodes whose ids are already available (inputs of the graph,
+// copied in by the scheduler) are considered.
+//
+// GGML_CPU_MMID_PREFETCH=0 disables the prefetch.
+// GGML_CPU_MMID_COLD=1 additionally marks the pages of an expert as cold once
+// its matmul is done, so that reclaiming them is cheap and happens in the
+// order the experts were last used.
+
+#if defined(__linux__) || defined(__APPLE__)
+#define GGML_MMID_MADVISE 1
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
+static int ggml_mmid_env_flag(const char * name, int def) {
+    const char * v = getenv(name);
+    if (v == NULL || v[0] == '\0') {
+        return def;
+    }
+    return atoi(v) != 0;
+}
+
+static bool ggml_mmid_prefetch_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = ggml_mmid_env_flag("GGML_CPU_MMID_PREFETCH", 1);
+    }
+    return enabled != 0;
+}
+
+static bool ggml_mmid_cold_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = ggml_mmid_env_flag("GGML_CPU_MMID_COLD", 0);
+    }
+    return enabled != 0;
+}
+
+static void ggml_mmid_madvise(const void * addr, size_t size, int advice) {
+#ifdef GGML_MMID_MADVISE
+    static long page_size = 0;
+    if (page_size <= 0) {
+        page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0) {
+            return;
+        }
+    }
+    const uintptr_t page  = (uintptr_t) page_size;
+    const uintptr_t first = (uintptr_t) addr & ~(page - 1);
+    const uintptr_t last  = ((uintptr_t) addr + size + page - 1) & ~(page - 1);
+    if (last <= first) {
+        return;
+    }
+    // errors are expected for memory that is not file-backed; nothing to do about them
+    (void) madvise((void *) first, last - first, advice);
+#else
+    GGML_UNUSED(addr);
+    GGML_UNUSED(size);
+    GGML_UNUSED(advice);
+#endif
+}
+
+// the experts of src0 selected by ids, as a per-expert flag; false if the node is not a candidate
+static bool ggml_mmid_selected_experts(const struct ggml_tensor * node, uint8_t * used, int64_t max_experts) {
+    const struct ggml_tensor * src0 = node->src[0];
+    const struct ggml_tensor * ids  = node->src[2];
+
+    if (src0 == NULL || ids == NULL) {
+        return false;
+    }
+    // the ids must be computed already: an input of this graph, not one of its nodes
+    if (ids->op != GGML_OP_NONE || ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (ids->data == NULL || ids->buffer == NULL || !ggml_backend_buffer_is_host(ids->buffer)) {
+        return false;
+    }
+    if (src0->data == NULL || src0->buffer == NULL || !ggml_backend_buffer_is_host(src0->buffer)) {
+        return false;
+    }
+
+    const int64_t n_as = src0->ne[2];
+    if (n_as <= 1 || n_as > max_experts || src0->nb[2] == 0) {
+        return false;
+    }
+
+    memset(used, 0, n_as);
+    for (int64_t i1 = 0; i1 < ids->ne[1]; ++i1) {
+        for (int64_t i0 = 0; i0 < ids->ne[0]; ++i0) {
+            const int32_t e = *(const int32_t *) ((const char *) ids->data + i1*ids->nb[1] + i0*ids->nb[0]);
+            if (e >= 0 && e < n_as) {
+                used[e] = 1;
+            }
+        }
+    }
+    return true;
+}
+
+static void ggml_graph_prefetch_mul_mat_id(const struct ggml_cgraph * cgraph) {
+#ifdef GGML_MMID_MADVISE
+    if (!ggml_mmid_prefetch_enabled()) {
+        return;
+    }
+
+    uint8_t used[4096];
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const struct ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+        if (!ggml_mmid_selected_experts(node, used, (int64_t) sizeof(used))) {
+            continue;
+        }
+        const struct ggml_tensor * src0 = node->src[0];
+        const size_t expert_size = src0->nb[2];
+        for (int64_t e = 0; e < src0->ne[2]; ++e) {
+            if (used[e]) {
+                ggml_mmid_madvise((const char *) src0->data + e*expert_size, expert_size, MADV_WILLNEED);
+            }
+        }
+    }
+#else
+    GGML_UNUSED(cgraph);
+#endif
+}
+
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
 
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
+
+    ggml_graph_prefetch_mul_mat_id(cgraph);
 
     int n_threads                               = cplan->n_threads;
     struct ggml_threadpool * threadpool = cplan->threadpool;
