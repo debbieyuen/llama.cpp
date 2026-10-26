@@ -167,6 +167,113 @@ static bool ggml_cuda_register_host_enabled() {
     return enabled;
 }
 
+// Zero-copy host weights (GGML_CUDA_HOST_ZERO_COPY=1).
+//
+// An integrated device that accesses pageable host memory through the host
+// page tables (DGX Spark / GB10: cudaDevAttrPageableMemoryAccessUsesHostPageTables)
+// can read a memory-mapped model file straight from its kernels. With this
+// enabled the backend accepts the "CPU_Mapped" buffers llama.cpp wraps around
+// an mmap, so the scheduler keeps a MUL_MAT_ID on the GPU with the experts
+// still in the mapping, instead of computing them on the CPU or uploading
+// them for every batch. Only the mapped weights are accepted: the scheduler's
+// own host buffers (graph inputs) keep being copied, so nothing on the host
+// overwrites memory a kernel may still be reading.
+//
+// The pages must be resident and mapped before a kernel touches them, since
+// a GPU page fault is serviced one page at a time through the IOMMU: the
+// experts a MUL_MAT_ID selects are prefetched on the host right before the
+// node runs (GGML_CUDA_HOST_PREFETCH: 0 = none, 1 = MADV_WILLNEED, 2 = also
+// MADV_POPULATE_READ, the default).
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+#endif
+#include <cstring>
+
+static bool ggml_cuda_host_zero_copy_requested() {
+    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_HOST_ZERO_COPY");
+    return enabled;
+}
+
+// true if buft is a host buffer type that the device may read in place
+static bool ggml_cuda_host_zero_copy_buft(int device, ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr || !ggml_cuda_info().devices[device].zero_copy_host || !ggml_backend_buft_is_host(buft)) {
+        return false;
+    }
+    const char * name = ggml_backend_buft_name(buft);
+    return name != nullptr && strcmp(name, "CPU_Mapped") == 0;
+}
+
+static bool ggml_cuda_host_zero_copy_node(int device, const ggml_tensor * node) {
+    return node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr && node->src[0]->buffer != nullptr &&
+        ggml_cuda_host_zero_copy_buft(device, node->src[0]->buffer->buft);
+}
+
+// prefetch the experts of a zero-copy MUL_MAT_ID into the page cache and the page tables
+static void ggml_cuda_host_prefetch_mul_mat_id(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+#if defined(__linux__)
+    static const int mode = ggml_cuda_env_int("GGML_CUDA_HOST_PREFETCH", 2);
+    if (mode <= 0) {
+        return;
+    }
+
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * ids  = node->src[2];
+
+    const int64_t n_as        = src0->ne[2];
+    const size_t  expert_size = src0->nb[2];
+    if (ids == nullptr || ids->type != GGML_TYPE_I32 || n_as <= 1 || expert_size == 0) {
+        return;
+    }
+
+    // the ids are produced by the kernels queued before this node
+    std::vector<int32_t> ids_host(ggml_nbytes(ids)/sizeof(int32_t));
+    if (ids->buffer != nullptr && ggml_backend_buffer_is_host(ids->buffer)) {
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        memcpy(ids_host.data(), ids->data, ggml_nbytes(ids));
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, ctx.stream()));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    }
+
+    std::vector<uint8_t> used(n_as, 0);
+    for (int64_t i1 = 0; i1 < ids->ne[1]; ++i1) {
+        for (int64_t i0 = 0; i0 < ids->ne[0]; ++i0) {
+            const int32_t e = ids_host[(i1*ids->nb[1] + i0*ids->nb[0])/sizeof(int32_t)];
+            if (e >= 0 && e < n_as) {
+                used[e] = 1;
+            }
+        }
+    }
+
+    static const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const auto advise = [&](int advice) {
+        for (int64_t e = 0; e < n_as; ++e) {
+            if (!used[e]) {
+                continue;
+            }
+            const uintptr_t first = ((uintptr_t) src0->data + e*expert_size) & ~(page - 1);
+            const uintptr_t last  = ((uintptr_t) src0->data + (e + 1)*expert_size + page - 1) & ~(page - 1);
+            // errors are not fatal: the kernel then faults the pages in itself, slowly
+            (void) madvise((void *) first, last - first, advice);
+        }
+    };
+
+    // start all the reads first, then wait for them while mapping the pages
+    advise(MADV_WILLNEED);
+    if (mode >= 2) {
+        advise(MADV_POPULATE_READ);
+    }
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(node);
+#endif
+}
+
 static bool ggml_cuda_fusion_disabled() {
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSION");
     return disabled;
@@ -350,6 +457,18 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.default_tensor_split[id] = total_vram;
         total_vram += device_vram;
         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
+        info.devices[id].zero_copy_host = false;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if (ggml_cuda_host_zero_copy_requested()) {
+            int pageable = 0;
+            int host_pt  = 0;
+            CUDA_CHECK(cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, physical_id));
+            CUDA_CHECK(cudaDeviceGetAttribute(&host_pt,  cudaDevAttrPageableMemoryAccessUsesHostPageTables, physical_id));
+            info.devices[id].zero_copy_host = prop.integrated && pageable && host_pt;
+            GGML_LOG_INFO("%s: device %d: zero-copy host weights %s (integrated = %d, pageable access = %d, host page tables = %d)\n",
+                __func__, id, info.devices[id].zero_copy_host ? "enabled" : "not available", (int) prop.integrated, pageable, host_pt);
+        }
+#endif
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
@@ -2719,6 +2838,13 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                     GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
                 }
             }
+            if (ggml_cuda_host_zero_copy_node(ggml_cuda_get_device(), node)) {
+                // the experts are prefetched on the host right before the node runs, which cannot be captured
+                use_cuda_graph = false;
+                if (ggml_cuda_graph_debug_enabled()) {
+                    GGML_LOG_DEBUG("%s: disabling CUDA graphs due to zero-copy host experts\n", __func__);
+                }
+            }
         }
 
         if (!use_cuda_graph) {
@@ -4690,6 +4816,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                if (ggml_cuda_host_zero_copy_node(cuda_ctx->device, node)) {
+                    ggml_cuda_host_prefetch_mul_mat_id(*cuda_ctx, node);
+                }
+
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
@@ -5965,7 +6095,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    if ((ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft))) {
+        return true;
+    }
+    return ggml_cuda_host_zero_copy_buft(dev_ctx->device, buft);
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
