@@ -1,7 +1,8 @@
 # llama.cpp with an SSD-streaming MoE expert store (branch `kimi-k3`)
 
-This branch is upstream llama.cpp at `547208dca250ceb3e4c8615598d043f2b602a527` plus three commits, one per
-patch of [xerootg/kimi-k3-spark](https://github.com/xerootg/kimi-k3-spark). That repo is the source of truth:
+This branch is upstream llama.cpp at `547208dca250ceb3e4c8615598d043f2b602a527` plus one commit per
+patch of [xerootg/kimi-k3-spark](https://github.com/xerootg/kimi-k3-spark), and later commits that bring the tree
+to newer patch sets (see the tags below). That repo is the source of truth:
 it holds the patches, the image build and the experiment ledger. This branch makes the same tree browsable and
 buildable as a normal llama.cpp checkout. Its tree is byte-identical to what the image build produces by
 running `git apply` on `patches/*.patch` in order.
@@ -10,13 +11,13 @@ running `git apply` on `patches/*.patch` in order.
 |---|---|---|
 | 1 | `0001-prefetch-mmapped-experts` | `madvise(MADV_WILLNEED)` of every selected expert slice for mmap'd MoE experts. On a DGX Spark with Kimi K3 this took decode from 147 s/token to 4.45 s/token. |
 | 2 | `0002-zero-copy-host-experts` | Opt-in (`GGML_CUDA_HOST_ZERO_COPY=1`) GPU reads of mmap'd host experts. A dead end on the GB10, where it ran at about 19 s/token; kept off. |
-| 3 | `0003-expert-store` | The engine. Routed experts are served from a repacked store file with O_DIRECT / io_uring reads into a host-RAM LRU that the GPU computes from directly. On top of that: self-prefetch and speculative prefetch, split expert GEMV, cache snapshot, memory lock, memory pressure valve, second-chance eviction, and the GH200 extras (HBM tier, prefill lookahead, Hopper Q6_K TMA GEMV). |
+| 3 | `0003-expert-store` | The engine. Routed experts are served from a repacked store file with O_DIRECT / io_uring reads into a host-RAM LRU that the GPU computes from directly. On top of that: self-prefetch and speculative prefetch, split expert GEMV, cache snapshot, memory lock, memory pressure valve, second-chance eviction, the GH200 extras (HBM tier, prefill lookahead, Hopper Q6_K TMA GEMV), and a remote expert tier: other boxes compute some experts' rows bit-identically (a SYCL kernel for Intel Arc iGPUs in kimi-k3-spark `tools/bitexact/`), with a local NVMe fallback so the output never depends on the network. |
 
 Results for Kimi K3 `UD-IQ1_S` (594 GB):
 
 | box | decode |
 |---|---|
-| one DGX Spark (128 GB unified memory) | 1.93 tok/s deployed, 1.96 tok/s with second-chance eviction |
+| one DGX Spark (128 GB unified memory) | 2.04-2.05 tok/s deployed (second-chance eviction, `/dev/cpu_dma_latency` held at 0; the remote tier on an Intel NUC is on but speed-neutral so far) |
 | a GH200 | about 13-13.8 tok/s |
 
 Every kept change is bit-identical to unpatched llama.cpp at temperature 0.
@@ -39,5 +40,10 @@ changes stay on by default even then:
 - patch 0001's prefetch for mmap'd experts (`GGML_CPU_MMID_PREFETCH=0` turns it off);
 - the Hopper Q6_K GEMV on sm_90 (`GGML_CUDA_MMVQ_Q6K_TMA=0` turns it off).
 
-The branch is not rebased onto newer upstream commits. When the pin in kimi-k3-spark moves, a new branch or tag is
-published.
+The branch is never rebased. A newer patch set on the same upstream pin is added as a new commit on top; when the
+upstream pin in kimi-k3-spark moves, a new branch is published. Tags mark each published patch set:
+
+| tag | kimi-k3-spark commit | notes |
+|---|---|---|
+| `kimi-k3-cdba886` | cdba886 (2026-10-26) | second-chance eviction |
+| `kimi-k3-e844a2a` | e844a2a (2026-10-28) | remote expert tier (`LLAMA_EXPERT_STORE_REMOTE*`, off by default); production on the Spark |

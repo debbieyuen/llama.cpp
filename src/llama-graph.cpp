@@ -2318,11 +2318,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the experts of host-resident layers may be read from the MoE cache
     // the split GEMV needs the expert lists to be plain slots: no per-expert bias and no weighting before the matmul
     moe_split_allowed = !weight_before_ffn && up_exps_b == nullptr && gate_exps_b == nullptr && gate_up_exps_b == nullptr && down_exps_b == nullptr;
+    moe_split_input = cur;
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
     ggml_tensor * split_late  = moe_split_late;
     ggml_tensor * split_merge = moe_split_merge;
     ggml_tensor * split_pf    = moe_split_pf;
+    ggml_tensor * split_rrows  = moe_split_rrows;
+    ggml_tensor * split_rmerge = moe_split_rmerge;
     moe_split_late = moe_split_merge = moe_split_pf = nullptr;
+    moe_split_rrows = moe_split_rmerge = moe_split_input = nullptr;
     moe_split_allowed = false;
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
@@ -2535,6 +2539,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * e17 = ggml_reshape_2d(ctx0, e_early, n_embd, n_expert_used + 1);
         ggml_tensor * e16 = ggml_reshape_2d(ctx0, e_late,  n_embd, split_late->ne[0]);
         ggml_tensor * merged = ggml_set_rows(ctx0, e17, e16, split_merge); // in place in e17
+        if (split_rrows != nullptr) {
+            // remote experts: their rows came back from the remote server (or, on a deadline miss, the late matmul
+            // computed them and every remote merge position is the scratch row)
+            merged = ggml_set_rows(ctx0, merged, split_rrows, split_rmerge);
+        }
         experts = ggml_view_3d(ctx0, merged, n_embd, n_expert_used, 1, merged->nb[1], merged->nb[1]*n_expert_used, 0);
         cb(experts, "ffn_moe_down_merged", il);
     } else {
@@ -2627,6 +2636,28 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
             ggml_format_name(early, "moe_early-%d", il);
             ggml_backend_sched_set_tensor_backend(sched, early, moe_cache->backend(il));
             ggml_build_forward_expand(gf, early);
+            // remote experts (LLAMA_EXPERT_STORE_REMOTE): as soon as the experts' input exists, copy it into the
+            // layer's registered input vector and post (waiting, a few us) so the poller sends it with the remote
+            // candidates the early lookup chose; the stream orders the copy before the post. Their rows come back
+            // into the remote rows and are merged after the late one (build_moe_ffn).
+            ggml_tensor * rpost_map = moe_split_input != nullptr ? moe_cache->get_split_map(il, 1, 6) : nullptr;
+            if (rpost_map != nullptr && ggml_nelements(moe_split_input) == moe_cache->get_split_map(il, 1, 7)->ne[0]) {
+                ggml_tensor * rx = moe_cache->get_split_map(il, 1, 7);
+                ggml_tensor * cp = ggml_cpy(ctx0, ggml_reshape_1d(ctx0, moe_split_input, rx->ne[0]), rx);
+                ggml_backend_sched_set_tensor_backend(sched, cp, moe_cache->backend(il));
+                ggml_build_forward_expand(gf, cp);
+                ggml_tensor * rpost = ggml_get_rows(ctx0, rpost_map, ids);
+                ggml_format_name(rpost, "moe_rpost-%d", il);
+                ggml_backend_sched_set_tensor_backend(sched, rpost, moe_cache->backend(il));
+                ggml_build_forward_expand(gf, rpost);
+                ggml_tensor * rrows = moe_cache->get_split_map(il, 1, 8); // F32 [n_out, n_remote_rows]
+                ggml_tensor * rpos  = ggml_view_1d(ctx0, moe_cache->get_split_map(il, 1, 5), rrows->ne[1], 0);
+                ggml_tensor * rmerge = ggml_get_rows(ctx0, moe_cache->get_split_map(il, 1, 9), rpos);
+                ggml_format_name(rmerge, "moe_nowait_rmerge-%d", il); // written by the real lookup, read after it
+                ggml_backend_sched_set_tensor_backend(sched, rmerge, moe_cache->backend(il));
+                moe_split_rrows  = rrows;
+                moe_split_rmerge = ggml_reshape_1d(ctx0, rmerge, rrows->ne[1]);
+            }
             for (ggml_tensor * t : moe_overlap) {
                 ggml_build_forward_expand(gf, t);
             }

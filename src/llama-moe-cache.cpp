@@ -45,6 +45,13 @@
 
 #include <sched.h>
 
+#if defined(__linux__)
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#endif
+
 namespace {
 
 // kimi-k3-spark patch 0003: LLAMA_EXPERT_STORE_CPUS=<cpu list, e.g. 0-9 or 0,2,4-7>: the store's I/O workers, the
@@ -740,6 +747,295 @@ private:
     std::atomic<bool>         failed{false};
 };
 
+// kimi-k3-spark patch 0003: remote experts (LLAMA_EXPERT_STORE_REMOTE=host:port[,host:port...]). Each remote box holds
+// a static set of records and computes those experts' rows for a single token: request = int32 [17] {k, global ids} +
+// the experts' input (n_in f32), reply = k rows of n_out f32, unweighted, in request order (a server may stream them
+// one by one). One remote_client per box: one persistent TCP connection (TCP_NODELAY), requests pipelined, replies
+// in order, a dedicated thread that sends and busy-polls the socket. The poller fills a slot (only when the slot is
+// free and the box is usable) and later consumes it or abandons it (its reply is still drained and dropped).
+// Reliability: a broken link (EOF, error, a send that stalls, or a request older than stale_ms) frees every slot in
+// flight and reconnects with exponential backoff (non-blocking connect with a timeout, so a box that vanished never
+// blocks); a box that misses its deadline trip_after times in a row is skipped for trip_ms (circuit breaker). The
+// cache reads anything that did not arrive from its own store, which gives the same rows, so a dead, slow or
+// rebooting box only costs speed.
+struct remote_client {
+    static constexpr int NSLOT = 8;
+    static constexpr int KMAX  = 16;
+    enum { FREE = 0, QUEUED = 1, SENT = 2, DONE = 3, ABANDONED = 4 };
+    struct slot {
+        std::atomic<int> state{FREE};
+        std::atomic<int> rows_done{0}; // rows of the reply complete so far
+        bool             sent = false; // net thread only
+        int32_t          hdr[1 + KMAX] = {};
+        std::vector<float> x;
+        std::vector<float> rows;
+        std::chrono::steady_clock::time_point t_post, t_done;
+    };
+    std::string host;
+    int         port = 0;
+    int         id = 0;
+    int         n_in = 0, n_out = 0;
+    int64_t     deadline_us = 3000;      // per box (LLAMA_EXPERT_STORE_REMOTE_DEADLINE_US, one value or one per box)
+    int         stale_ms = 1000;         // LLAMA_EXPERT_STORE_REMOTE_STALE_MS: a request unanswered this long drops the link
+    int         trip_after = 8;          // LLAMA_EXPERT_STORE_REMOTE_TRIP: consecutive deadline misses that trip the breaker
+    int         trip_ms = 2000;          // LLAMA_EXPERT_STORE_REMOTE_TRIP_MS: how long a tripped box is skipped
+    slot        slots[NSLOT];
+    uint64_t    seq_post = 0;              // poller only
+    std::atomic<uint64_t> seq_queued{0};   // published by the poller after a slot is QUEUED
+    std::atomic<bool> connected{false};
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> n_connects{0}, n_disconnects{0}, n_stale{0};
+    // poller-side state and stats
+    int      misses_in_row = 0;
+    std::chrono::steady_clock::time_point tripped_until{};
+    uint64_t n_trips = 0, n_posts = 0, n_rows = 0, n_hits = 0, n_late = 0, n_late_rows = 0, n_partial = 0, n_nan_rows = 0,
+             n_unsent = 0, n_shadow_ontime = 0;
+    std::vector<uint32_t> rtt_us = std::vector<uint32_t>(16384, 0); // post -> complete reply, of the replies in time (ring)
+    size_t   rtt_next = 0;
+    std::thread th;
+
+    bool start(const std::string & hp, int box, int nin, int nout) {
+        const size_t c = hp.rfind(':');
+        if (c == std::string::npos || c == 0) {
+            return false;
+        }
+        host = hp.substr(0, c);
+        port = atoi(hp.c_str() + c + 1);
+        sockaddr_in a = {};
+        if (port <= 0 || inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1) {
+            return false;
+        }
+        id = box;
+        n_in = nin;
+        n_out = nout;
+        for (slot & s : slots) {
+            s.x.assign((size_t) n_in, 0.0f);
+            s.rows.assign((size_t) KMAX*n_out, 0.0f);
+        }
+        th = std::thread([this] { main(); });
+        return true;
+    }
+    void shutdown() {
+        stop = true;
+        if (th.joinable()) {
+            th.join();
+        }
+    }
+    ~remote_client() { shutdown(); }
+
+    // poller: the slot the next post would use, if the box is usable now (link up, breaker closed, slot free)
+    slot * next_free() {
+        if (!connected.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+        if (misses_in_row >= trip_after) {
+            const auto now = std::chrono::steady_clock::now();
+            if (tripped_until == std::chrono::steady_clock::time_point{}) {
+                tripped_until = now + std::chrono::milliseconds(trip_ms);
+                n_trips++;
+                LLAMA_LOG_WARN("expert store: remote box %d (%s:%d): %d deadline misses in a row, skipped for %d ms\n", id, host.c_str(), port, misses_in_row, trip_ms);
+            }
+            if (now < tripped_until) {
+                return nullptr;
+            }
+            // half open: one more try; a hit closes the breaker, a miss re-trips it
+            tripped_until = {};
+            misses_in_row = trip_after - 1;
+        }
+        slot & s = slots[seq_post % NSLOT];
+        return s.state.load(std::memory_order_acquire) == FREE ? &s : nullptr;
+    }
+    // poller: hand a filled slot (hdr, x) to the net thread
+    void post(slot * s) {
+        s->t_post = std::chrono::steady_clock::now();
+        s->rows_done.store(0, std::memory_order_relaxed);
+        s->state.store(QUEUED, std::memory_order_release);
+        seq_post++;
+        seq_queued.store(seq_post, std::memory_order_release);
+    }
+    // poller: give up on a slot (deadline); true if it was done after all
+    bool abandon(slot * s) {
+        int st = SENT;
+        if (s->state.compare_exchange_strong(st, ABANDONED)) {
+            return false;
+        }
+        st = QUEUED;
+        if (s->state.compare_exchange_strong(st, ABANDONED)) {
+            return false;
+        }
+        return st == DONE; // DONE (consume it) or FREE (the link broke)
+    }
+
+    // non-blocking connect with a timeout: a box that is down or rebooting must not block this thread (or shutdown)
+    int try_connect(int timeout_ms) {
+        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        if (fd < 0) {
+            return -1;
+        }
+        sockaddr_in a = {};
+        a.sin_family = AF_INET;
+        a.sin_port = htons((uint16_t) port);
+        inet_pton(AF_INET, host.c_str(), &a.sin_addr);
+        if (connect(fd, (sockaddr *) &a, sizeof a) != 0) {
+            if (errno != EINPROGRESS) {
+                close(fd);
+                return -1;
+            }
+            pollfd p = { fd, POLLOUT, 0 };
+            int err = 0;
+            socklen_t len = sizeof err;
+            if (poll(&p, 1, timeout_ms) != 1 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0) {
+                close(fd);
+                return -1;
+            }
+        }
+        // back to blocking for the sends, bounded by a send timeout; the receives use MSG_DONTWAIT
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        timeval tv = { 0, 200000 };
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        return fd;
+    }
+
+    void main() {
+        store_pin_thread();
+        int fd = -1;
+        uint64_t next_send = 0, next_recv = 0;
+        size_t got = 0;      // bytes of the head reply received
+        int idle = 0;
+        int backoff_ms = 50;
+        bool warned = false;
+        auto drop_link = [&](const char * why) {
+            if (fd >= 0) {
+                close(fd);
+                fd = -1;
+            }
+            connected.store(false, std::memory_order_release);
+            n_disconnects++;
+            LLAMA_LOG_WARN("expert store: remote box %d (%s:%d): %s, reconnecting\n", id, host.c_str(), port, why);
+            // everything in flight is lost: free the slots (a poller waiting on one sees FREE and reads locally)
+            for (slot & s : slots) {
+                s.sent = false;
+                s.state.store(FREE, std::memory_order_release);
+            }
+            next_send = next_recv = seq_queued.load(std::memory_order_acquire);
+            got = 0;
+            backoff_ms = 50;
+        };
+        while (!stop.load(std::memory_order_relaxed)) {
+            if (fd < 0) {
+                fd = try_connect(500);
+                if (fd < 0) {
+                    if (!warned) {
+                        LLAMA_LOG_WARN("expert store: remote box %d (%s:%d): not reachable, retrying with backoff (its experts are read locally meanwhile)\n", id, host.c_str(), port);
+                        warned = true;
+                    }
+                    for (int i = 0; i < backoff_ms/10 && !stop.load(); ++i) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    }
+                    backoff_ms = std::min(backoff_ms*2, 2000);
+                    continue;
+                }
+                warned = false;
+                next_send = next_recv = seq_queued.load(std::memory_order_acquire);
+                got = 0;
+                n_connects++;
+                LLAMA_LOG_INFO("expert store: remote box %d: connected to %s:%d\n", id, host.c_str(), port);
+                connected.store(true, std::memory_order_release);
+            }
+            bool work = false;
+            // send everything queued, in order
+            const uint64_t q = seq_queued.load(std::memory_order_acquire);
+            bool broken = false;
+            while (next_send < q) {
+                slot & s = slots[next_send % NSLOT];
+                if (s.state.load(std::memory_order_acquire) == QUEUED) {
+                    if (!send_all(fd, s.hdr, sizeof s.hdr) || !send_all(fd, s.x.data(), (size_t) n_in*sizeof(float))) {
+                        broken = true;
+                        break;
+                    }
+                    s.sent = true;
+                    int st = QUEUED;
+                    s.state.compare_exchange_strong(st, SENT); // or it was abandoned meanwhile: still drain its reply
+                } // else abandoned before it was sent: nothing to receive
+                next_send++;
+                work = true;
+            }
+            if (broken) {
+                drop_link("send failed");
+                continue;
+            }
+            // receive the head replies
+            while (next_recv < next_send) {
+                slot & s = slots[next_recv % NSLOT];
+                if (!s.sent) {
+                    int st = ABANDONED;
+                    s.state.compare_exchange_strong(st, FREE);
+                    next_recv++;
+                    continue;
+                }
+                const size_t want = (size_t) s.hdr[0]*n_out*sizeof(float);
+                const ssize_t r = recv(fd, (char *) s.rows.data() + got, want - got, MSG_DONTWAIT);
+                if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                    broken = true;
+                    break;
+                }
+                if (r < 0) {
+                    // nothing yet: a server that stopped answering (hung, paused) is dropped after stale_ms
+                    if (std::chrono::steady_clock::now() - s.t_post > std::chrono::milliseconds(stale_ms)) {
+                        n_stale++;
+                        broken = true;
+                    }
+                    break;
+                }
+                work = true;
+                got += (size_t) r;
+                s.rows_done.store((int) (got/((size_t) n_out*sizeof(float))), std::memory_order_release);
+                if (got < want) {
+                    continue;
+                }
+                got = 0;
+                s.sent = false;
+                s.t_done = std::chrono::steady_clock::now();
+                int st = SENT;
+                if (!s.state.compare_exchange_strong(st, DONE)) {
+                    s.state.store(FREE, std::memory_order_release); // abandoned: drop it
+                }
+                next_recv++;
+            }
+            if (broken) {
+                drop_link("connection lost or server not answering");
+                continue;
+            }
+            if (work || next_recv < next_send) {
+                idle = 0;
+            } else if (++idle > 200000) {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+        }
+        if (fd >= 0) {
+            close(fd);
+        }
+        connected.store(false);
+    }
+    static bool send_all(int fd, const void * p, size_t n) {
+        const char * c = (const char *) p;
+        while (n) {
+            const ssize_t r = send(fd, c, n, MSG_NOSIGNAL);
+            if (r <= 0) {
+                if (r < 0 && errno == EINTR) {
+                    continue;
+                }
+                return false; // includes the send timeout (EAGAIN): a server that stopped reading
+            }
+            c += r;
+            n -= (size_t) r;
+        }
+        return true;
+    }
+};
+
 // kimi-k3-spark patch 0003: the speculative reader of the predictive prefetch. The predicted misses of the next layer
 // are read here, on a thread of its own with a bounded number of pieces in flight, during the part of a layer in
 // which the drive would otherwise sit idle (the expert matmuls, the next layer's attention and router). The real
@@ -1381,6 +1677,11 @@ struct llama_moe_cache::impl {
         ggml_tensor * early_map = nullptr;  // I32 [1, n_expert], by expert
         ggml_tensor * late_map  = nullptr;  // I32 [1, n_expert], by position
         ggml_tensor * merge_map = nullptr;  // I32 [1, n_expert], by position
+        // remote experts (remote below), only for layers with experts in the remote set
+        ggml_tensor * rpost_map   = nullptr; // I32 [1, n_expert]: the map of the "moe_rpost-<il>" post (never read)
+        ggml_tensor * remote_x    = nullptr; // F32 [n_in]: the experts' input, copied here by the GPU before the post
+        ggml_tensor * remote_rows = nullptr; // F32 [n_out, remote_rows_max]
+        ggml_tensor * rmerge_map  = nullptr; // I32 [1, n_expert], by position: merge row of each remote row
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
     };
 
@@ -1486,6 +1787,44 @@ struct llama_moe_cache::impl {
     ggml_tensor * split_iota = nullptr; // I32 [1, n_expert_used] = 0, 1, ...: the ids of the late and merge lookups (position-indexed maps)
     uint64_t n_split_calls = 0, n_split_fallback = 0, n_split_sync = 0, n_split_sync_records = 0, n_split_early_hits = 0, n_split_late = 0, t_split_plan_us = 0, t_split_wait_us = 0;
     std::vector<uint8_t> split_miss; // [n_expert] scratch of fill_early: 1 if the expert is read by this fill
+
+    // remote experts (LLAMA_EXPERT_STORE_REMOTE=host:port[,host:port...] + LLAMA_EXPERT_STORE_REMOTE_SET=<one file of
+    // "layer expert" lines per box, comma separated in the same order>; needs the split GEMV): static sets of experts
+    // held by other boxes. At the early lookup, the selected experts of a usable box's set that are not resident are
+    // left out of the plan (no slot, no read; early map: the zero record) and become the layer's remote candidates,
+    // grouped by box. After the early post the graph copies the experts' input into the layer's remote input and
+    // posts "moe_rpost-<il>": the poller sends input + ids to every box involved. The real lookup waits for each box's
+    // reply up to its deadline (from its post), places the rows that arrived (partial replies included, NaN rows
+    // refused) in the layer's remote rows with their merge positions, and reads every missing expert locally into
+    // the late matmul's free rows instead. The rows are the same either way.
+    std::vector<std::unique_ptr<remote_client>> remotes;
+    std::vector<uint8_t> remote_box;   // [n_layer*n_expert]: 0 = local, else box index + 1
+    bool     remote_shadow = false;    // LLAMA_EXPERT_STORE_REMOTE_SHADOW=1: send and time, but read every expert locally
+    int      remote_rows_max = 8;      // LLAMA_EXPERT_STORE_REMOTE_ROWS: rows per layer at most (all boxes together)
+    int32_t  remote_il = -1;           // layer of the early lookup whose remote candidates are pending
+    std::vector<int32_t> remote_ids;   // its candidates (experts), grouped by box, their positions among the selected
+    std::vector<int32_t> remote_pos;   // experts, and per box the first candidate, the count and the request sent
+    std::vector<int32_t> remote_off, remote_cnt;
+    std::vector<remote_client::slot *> remote_slot;
+    std::vector<uint8_t> remote_usable;   // scratch of fill_early: box usable now
+    std::vector<int32_t> remote_split_box, remote_fill_at; // scratch of fill_early
+    std::vector<int32_t> remote_local; // scratch of fill_early: the selected experts that stay local
+    std::vector<int32_t> remote_pf;    // scratch of prefetch_decode: the predictions minus the remote ones
+    std::vector<int32_t> remote_miss_ids, remote_miss_pos; // scratch of remote_resolve: the rows that did not arrive
+    size_t   split_late_used = 0;      // late rows the early lookup filled
+    uint64_t n_remote_layers = 0, t_remote_wait_us = 0, n_remote_fallback_layers = 0;
+    int      remote_dma_fd = -1;      // /dev/cpu_dma_latency, held while the remote experts are on
+    bool remote_on() const {
+        return !remotes.empty();
+    }
+    // the box that would serve expert x of layer il now, or -1 (local: not in a set, or the box is not usable)
+    int remote_box_of(int32_t il, int32_t x) {
+        if (!remote_on()) {
+            return -1;
+        }
+        const int b = (int) remote_box[(size_t) il*store.n_expert + x] - 1;
+        return b >= 0 && remotes[b]->connected.load(std::memory_order_acquire) ? b : -1;
+    }
     struct fill_thread {
         std::thread              th;
         std::mutex               m;
@@ -2335,6 +2674,70 @@ struct llama_moe_cache::impl {
         // within a device the budget is split by the size of the experts, so each group caches the same fraction of its experts
         std::vector<size_t> n_tensors(devices.size(), 0);
         split_req = use_store && getenv("LLAMA_EXPERT_STORE_SPLIT") != nullptr && getenv("LLAMA_EXPERT_STORE_SPLIT")[0] == '1';
+        // remote experts: the sets are read here (one file per box), the connections start once the maps exist
+        std::vector<std::string> remote_hosts;
+        if (getenv("LLAMA_EXPERT_STORE_REMOTE") != nullptr && getenv("LLAMA_EXPERT_STORE_REMOTE")[0] != 0) {
+            auto split_list = [](const char * v) {
+                std::vector<std::string> out;
+                std::string cur;
+                for (const char * c = v; ; ++c) {
+                    if (*c == ',' || *c == 0) {
+                        if (!cur.empty()) {
+                            out.push_back(cur);
+                        }
+                        cur.clear();
+                        if (*c == 0) {
+                            break;
+                        }
+                    } else if (*c != ' ') {
+                        cur += *c;
+                    }
+                }
+                return out;
+            };
+            remote_hosts = split_list(getenv("LLAMA_EXPERT_STORE_REMOTE"));
+            const std::vector<std::string> sets = getenv("LLAMA_EXPERT_STORE_REMOTE_SET") ? split_list(getenv("LLAMA_EXPERT_STORE_REMOTE_SET")) : std::vector<std::string>();
+            if (!split_req || store.n_expert == 0 || sets.size() != remote_hosts.size() || remote_hosts.size() > 250) {
+                LLAMA_LOG_WARN("%s: expert store: LLAMA_EXPERT_STORE_REMOTE needs LLAMA_EXPERT_STORE_SPLIT=1 and one LLAMA_EXPERT_STORE_REMOTE_SET file per box, off\n", __func__);
+                remote_hosts.clear();
+            }
+            size_t n_set = 0;
+            for (size_t bx = 0; bx < remote_hosts.size(); ++bx) {
+                FILE * f = fopen(sets[bx].c_str(), "r");
+                if (f == nullptr) {
+                    LLAMA_LOG_WARN("%s: expert store: cannot read the remote set %s, remote experts off\n", __func__, sets[bx].c_str());
+                    remote_hosts.clear();
+                    remote_box.clear();
+                    break;
+                }
+                if (remote_box.empty()) {
+                    remote_box.assign(model.layers.size()*(size_t) store.n_expert, 0);
+                }
+                int a = 0, b = 0;
+                while (fscanf(f, "%d %d", &a, &b) == 2) {
+                    if (a >= 0 && (size_t) a < model.layers.size() && b >= 0 && (uint32_t) b < store.n_expert && !remote_box[(size_t) a*store.n_expert + b]) {
+                        remote_box[(size_t) a*store.n_expert + b] = (uint8_t) (bx + 1); // an expert listed twice stays with the first box
+                        n_set++;
+                    }
+                }
+                fclose(f);
+            }
+            if (n_set == 0) {
+                remote_box.clear();
+                remote_hosts.clear();
+            }
+        }
+        auto layer_has_remote = [&](int32_t il) {
+            if (remote_box.empty()) {
+                return false;
+            }
+            for (uint32_t x = 0; x < store.n_expert; ++x) {
+                if (remote_box[(size_t) il*store.n_expert + x]) {
+                    return true;
+                }
+            }
+            return false;
+        };
         size_t n_tensors_host = 0;
         for (group & g : groups) {
             const device & d = devices[g.id];
@@ -2367,6 +2770,9 @@ struct llama_moe_cache::impl {
             n_tensors_host  += g.layers.size();
             if (split_req && use_store) {
                 n_tensors_host += 3*g.layers.size() + 2; // early, late and merge maps, the zero record's slot, the iota
+                for (int32_t il : g.layers) {
+                    n_tensors_host += layer_has_remote(il) ? 4 : 0; // remote post map, input, rows, merge map
+                }
             }
         }
         if (n_tensors_host == 0) {
@@ -2493,6 +2899,33 @@ struct llama_moe_cache::impl {
                         ggml_format_name(split_iota, "moe_cache.split_iota");
                         buf_host_size += GGML_PAD(ggml_nbytes(split_iota), alignment_host);
                     }
+                    if (layer_has_remote(il)) {
+                        int64_t n_in = 0, n_out = 0;
+                        for (const ggml_tensor * t : l.experts) {
+                            if (strstr(t->name, "down") != nullptr) {
+                                n_out = t->ne[1];
+                            } else {
+                                n_in = t->ne[0];
+                            }
+                        }
+                        GGML_ASSERT(n_in > 0 && n_out > 0);
+                        remote_rows_max = getenv("LLAMA_EXPERT_STORE_REMOTE_ROWS") != nullptr ?
+                            std::min(std::max(1, atoi(getenv("LLAMA_EXPERT_STORE_REMOTE_ROWS"))), std::min(n_expert_used, (int32_t) remote_client::KMAX)) :
+                            std::min(remote_rows_max, n_expert_used);
+                        l.rpost_map   = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                        l.remote_x    = ggml_new_tensor_1d(ctx_host.get(), GGML_TYPE_F32, n_in);
+                        l.remote_rows = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_F32, n_out, remote_rows_max);
+                        l.rmerge_map  = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                        ggml_format_name(l.rpost_map,   "moe_cache.rpost_map-%d", il);
+                        ggml_format_name(l.remote_x,    "moe_cache.remote_x-%d", il);
+                        ggml_format_name(l.remote_rows, "moe_cache.remote_rows-%d", il);
+                        ggml_format_name(l.rmerge_map,  "moe_cache.rmerge_map-%d", il);
+                        layer_of[l.rpost_map] = il;
+                        map_kind[l.rpost_map] = 6;
+                        for (ggml_tensor * t : { l.rpost_map, l.remote_x, l.remote_rows, l.rmerge_map }) {
+                            buf_host_size += GGML_PAD(ggml_nbytes(t), alignment_host);
+                        }
+                    }
                 }
             }
             if (!use_store) {
@@ -2605,6 +3038,88 @@ struct llama_moe_cache::impl {
                 split_miss.assign((size_t) store.n_expert, 0);
                 if (getenv("LLAMA_EXPERT_STORE_SPLIT_LATE") != nullptr) {
                     split_late_max = std::min(std::max(1, atoi(getenv("LLAMA_EXPERT_STORE_SPLIT_LATE"))), n_expert_used);
+                }
+                // remote experts: every remote merge position is the scratch row, the rows are zero
+                int64_t r_in = 0, r_out = 0;
+                for (const layer & l : layers) {
+                    if (l.rpost_map == nullptr) {
+                        continue;
+                    }
+                    std::vector<int32_t> m((size_t) l.rmerge_map->ne[1], n_expert_used);
+                    ggml_backend_tensor_set(l.rmerge_map, m.data(), 0, ggml_nbytes(l.rmerge_map));
+                    memset(l.remote_rows->data, 0, ggml_nbytes(l.remote_rows));
+                    memset(l.remote_x->data, 0, ggml_nbytes(l.remote_x));
+                    r_in = l.remote_x->ne[0];
+                    r_out = l.remote_rows->ne[0];
+                }
+                if (split && !remote_box.empty() && r_in > 0) {
+                    remote_shadow = getenv("LLAMA_EXPERT_STORE_REMOTE_SHADOW") != nullptr && getenv("LLAMA_EXPERT_STORE_REMOTE_SHADOW")[0] == '1';
+                    // deadline: one value for every box or one per box
+                    std::vector<int64_t> dl;
+                    if (const char * v = getenv("LLAMA_EXPERT_STORE_REMOTE_DEADLINE_US")) {
+                        for (const char * c = v; *c; ) {
+                            char * end = nullptr;
+                            const long d = strtol(c, &end, 10);
+                            if (end == c) {
+                                break;
+                            }
+                            dl.push_back(std::max(0L, d));
+                            c = *end == ',' ? end + 1 : end;
+                        }
+                    }
+                    auto env_int = [](const char * k, int def) { return getenv(k) != nullptr ? atoi(getenv(k)) : def; };
+                    std::vector<size_t> n_per(remote_hosts.size(), 0);
+                    for (uint8_t v : remote_box) {
+                        if (v) {
+                            n_per[v - 1]++;
+                        }
+                    }
+                    for (size_t bx = 0; bx < remote_hosts.size(); ++bx) {
+                        auto rc = std::make_unique<remote_client>();
+                        rc->deadline_us = dl.empty() ? 3000 : dl[std::min(bx, dl.size() - 1)];
+                        rc->stale_ms    = std::max(50, env_int("LLAMA_EXPERT_STORE_REMOTE_STALE_MS", 1000));
+                        rc->trip_after  = std::max(1, env_int("LLAMA_EXPERT_STORE_REMOTE_TRIP", 8));
+                        rc->trip_ms     = std::max(0, env_int("LLAMA_EXPERT_STORE_REMOTE_TRIP_MS", 2000));
+                        if (!rc->start(remote_hosts[bx], (int) bx, (int) r_in, (int) r_out)) {
+                            LLAMA_LOG_WARN("%s: expert store: remote box %zu: '%s' is not ipv4:port, remote experts off\n", __func__, bx, remote_hosts[bx].c_str());
+                            remotes.clear();
+                            break;
+                        }
+                        LLAMA_LOG_INFO("%s: expert store: remote box %zu: %zu experts at %s, deadline %lld us\n", __func__,
+                            bx, n_per[bx], remote_hosts[bx].c_str(), (long long) rc->deadline_us);
+                        remotes.push_back(std::move(rc));
+                    }
+                    if (remote_on()) {
+                        // the round trip is short enough that the Spark's idle states matter: its network IRQ cores
+                        // sleep in a deep state (~430 us exit) between requests. Hold /dev/cpu_dma_latency while the
+                        // remote experts are on (PM QoS: released when the fd closes, i.e. at exit).
+                        // LLAMA_EXPERT_STORE_REMOTE_DMA_LATENCY=<us> (default 0), -1 leaves the idle states alone.
+                        const int dma_us = getenv("LLAMA_EXPERT_STORE_REMOTE_DMA_LATENCY") != nullptr ? atoi(getenv("LLAMA_EXPERT_STORE_REMOTE_DMA_LATENCY")) : 0;
+                        if (dma_us >= 0) {
+                            remote_dma_fd = open("/dev/cpu_dma_latency", O_WRONLY | O_CLOEXEC);
+                            const int32_t v = dma_us;
+                            if (remote_dma_fd < 0 || write(remote_dma_fd, &v, sizeof v) != (ssize_t) sizeof v) {
+                                LLAMA_LOG_WARN("%s: expert store: remote experts: cannot hold /dev/cpu_dma_latency (%s): the round trips "
+                                    "pay the CPUs' idle exit latency (needs root or a udev rule giving the server's user write access; "
+                                    "in a container, the device mapped in)\n", __func__, strerror(errno));
+                                if (remote_dma_fd >= 0) {
+                                    close(remote_dma_fd);
+                                }
+                                remote_dma_fd = -1;
+                            } else {
+                                LLAMA_LOG_INFO("%s: expert store: remote experts: holding /dev/cpu_dma_latency = %d us\n", __func__, dma_us);
+                            }
+                        }
+                        remote_off.assign(remotes.size(), 0);
+                        remote_cnt.assign(remotes.size(), 0);
+                        remote_slot.assign(remotes.size(), nullptr);
+                        remote_usable.assign(remotes.size(), 0);
+                        remote_split_box.assign((size_t) n_expert_used*4, -1);
+                        LLAMA_LOG_INFO("%s: expert store: remote experts: %zu boxes, up to %d rows per layer%s\n", __func__,
+                            remotes.size(), remote_rows_max, remote_shadow ? ", SHADOW (every expert is still read locally)" : "");
+                    }
+                } else if (!remote_box.empty()) {
+                    LLAMA_LOG_WARN("%s: expert store: remote experts need the split GEMV, off\n", __func__);
                 }
             }
 
@@ -2763,6 +3278,9 @@ struct llama_moe_cache::impl {
 
     ~impl() {
         log_stats();
+        if (remote_dma_fd >= 0) {
+            close(remote_dma_fd);
+        }
         valve_stop_thread(); // no release runs from here on
         if (use_store && !devices.empty()) {
             ggml_backend_dev_t cpu_dev = ggml_backend_get_device(devices[0].backend);
@@ -2823,6 +3341,8 @@ struct llama_moe_cache::impl {
                     self->fill_early(it->second, ids, (size_t) n_ids);
                 } else if (mk->second == 2) {
                     self->fill_late(it->second, ids, (size_t) n_ids);
+                } else if (mk->second == 6) {
+                    self->remote_post(it->second);
                 }
                 return; // the merge map (3) needs no fill: the real lookup wrote it
             }
@@ -3170,32 +3690,121 @@ struct llama_moe_cache::impl {
             split_il = -1;
             n_split_fallback++;
         }
+        // remote experts: the selected experts of a usable box's set that are not in the bank go to that box instead
+        // of the plan, as many as the late matmul can still take if the replies miss their deadlines (local misses
+        // first: those are read anyway), best router scores first, grouped by box
+        remote_il = -1;
+        remote_ids.clear();
+        remote_pos.clear();
+        const int32_t * plan_ids = ids_data;
+        size_t n_plan = n_ids;
+        if (remote_on() && l.rpost_map != nullptr) {
+            int32_t * rm = (int32_t *) l.rmerge_map->data;
+            for (int r = 0; r < remote_rows_max; ++r) {
+                rm[r] = n_expert_used; // the scratch row (the GPU finished this layer's previous token long ago)
+            }
+            const size_t nb = remotes.size();
+            bool any = false;
+            for (size_t bx = 0; bx < nb; ++bx) {
+                remote_cnt[bx] = 0;
+                remote_slot[bx] = nullptr;
+                remote_usable[bx] = remotes[bx]->next_free() != nullptr;
+                any = any || remote_usable[bx];
+            }
+            if (any) {
+                auto box_of = [&](int32_t x) -> int {
+                    if (g.lru.slot_map[il][x] >= 0) {
+                        return -1;
+                    }
+                    const int bx = (int) remote_box[(size_t) il*store.n_expert + x] - 1;
+                    return bx >= 0 && remote_usable[bx] ? bx : -1;
+                };
+                size_t n_local_miss = 0;
+                for (size_t i = 0; i < n_ids; ++i) {
+                    const int32_t x = ids_data[i];
+                    const int32_t sl = g.lru.slot_map[il][x];
+                    if (box_of(x) >= 0) {
+                        continue;
+                    }
+                    if (sl < 0 || (spec_ok() && g.spec_state[sl].load(std::memory_order_acquire) != 0)) {
+                        n_local_miss++;
+                    }
+                }
+                const size_t cap = std::min((size_t) remote_rows_max, n_local_miss < (size_t) split_late_max ? (size_t) split_late_max - n_local_miss : 0);
+                remote_local.clear();
+                size_t taken = 0;
+                for (size_t i = 0; i < n_ids; ++i) {
+                    const int32_t x = ids_data[i];
+                    const int bx = taken < cap ? box_of(x) : -1;
+                    if (bx >= 0) {
+                        remote_split_box[i] = bx;
+                        remote_cnt[bx]++;
+                        taken++;
+                    } else {
+                        remote_split_box[i] = -1;
+                        remote_local.push_back(x);
+                    }
+                }
+                if (taken > 0) {
+                    // grouped by box: box bx's candidates are remote_ids[remote_off[bx] .. + remote_cnt[bx]]
+                    int32_t off = 0;
+                    for (size_t bx = 0; bx < nb; ++bx) {
+                        remote_off[bx] = off;
+                        off += remote_cnt[bx];
+                    }
+                    remote_ids.assign(taken, -1);
+                    remote_pos.assign(taken, -1);
+                    std::vector<int32_t> & fill_at = remote_fill_at;
+                    fill_at.assign(remote_off.begin(), remote_off.end());
+                    for (size_t i = 0; i < n_ids; ++i) {
+                        const int bx = remote_split_box[i];
+                        if (bx >= 0) {
+                            remote_ids[fill_at[bx]] = ids_data[i];
+                            remote_pos[fill_at[bx]] = (int32_t) i;
+                            fill_at[bx]++;
+                        }
+                    }
+                    remote_il = il;
+                    n_remote_layers++;
+                    if (!remote_shadow) {
+                        plan_ids = remote_local.data();
+                        n_plan = remote_local.size();
+                    }
+                }
+            }
+        }
         size_t n_hit = 0;
-        fill_plan(il, ids_data, n_ids, true, n_hit);
-        split_ids.assign(ids_data, ids_data + n_ids);
+        fill_plan(il, plan_ids, n_plan, true, n_hit);
+        split_ids.assign(plan_ids, plan_ids + n_plan);
         // misses: the records read now, and the speculative reader's records still in flight (adopted at the real lookup)
         for (const auto & f : fills) {
             split_miss[f.expert] = 1;
         }
+        const size_t n_remote = remote_shadow ? 0 : remote_ids.size();
+        for (size_t r = 0; r < n_remote; ++r) {
+            split_miss[remote_ids[r]] = 2; // remote: no slot, the zero record at the early lookup, not in the late matmul
+        }
+        const size_t late_cap = (size_t) split_late_max - n_remote;
         if (spec_ok()) {
             for (size_t i = 0; i < n_ids; ++i) {
-                if (g.spec_state[g.lru.slot_map[il][ids_data[i]]].load(std::memory_order_acquire) != 0) {
+                const int32_t sl = g.lru.slot_map[il][ids_data[i]];
+                if (sl >= 0 && split_miss[ids_data[i]] != 2 && g.spec_state[sl].load(std::memory_order_acquire) != 0) {
                     split_miss[ids_data[i]] = 1;
                 }
             }
         }
         size_t n_miss = 0;
         for (size_t i = 0; i < n_ids; ++i) {
-            n_miss += split_miss[ids_data[i]];
+            n_miss += split_miss[ids_data[i]] == 1;
         }
-        if (n_miss > (size_t) split_late_max) {
+        if (n_miss > late_cap) {
             // too many for the late matmul: first wait for the speculative reader's records (nearly done, usually)
             n_split_sync++;
             if (spec_ok()) {
                 spec_adopt(il, g);
                 for (size_t i = 0; i < n_ids; ++i) {
                     const int32_t x = ids_data[i];
-                    if (split_miss[x] && g.lru.slot_map[il][x] >= 0 && g.spec_state[g.lru.slot_map[il][x]].load(std::memory_order_acquire) == 0) {
+                    if (split_miss[x] == 1 && g.lru.slot_map[il][x] >= 0 && g.spec_state[g.lru.slot_map[il][x]].load(std::memory_order_acquire) == 0) {
                         // complete now, unless it is one of this fill's own reads
                         bool own = false;
                         for (const auto & f : fills) {
@@ -3209,8 +3818,8 @@ struct llama_moe_cache::impl {
                 }
             }
             // then read the excess misses here, synchronously; the rest go to the fill thread
-            if (n_miss > (size_t) split_late_max) {
-                const size_t n_sync = n_miss - (size_t) split_late_max;
+            if (n_miss > late_cap) {
+                const size_t n_sync = n_miss - late_cap;
                 GGML_ASSERT(n_sync <= jobs.size());
                 std::vector<io_pool::job> sync_jobs(jobs.begin(), jobs.begin() + n_sync);
                 if (!pool->run(store.fd, sync_jobs)) {
@@ -3221,7 +3830,7 @@ struct llama_moe_cache::impl {
                 }
                 jobs.erase(jobs.begin(), jobs.begin() + n_sync);
                 n_split_sync_records += n_sync;
-                n_miss = split_late_max;
+                n_miss = late_cap;
             }
         }
         const bool sync = false;
@@ -3232,7 +3841,9 @@ struct llama_moe_cache::impl {
         for (size_t i = 0; i < n_ids; ++i) {
             const int32_t x = ids_data[i];
             const int32_t s = g.lru.slot_map[il][x];
-            if (split_miss[x]) {
+            if (split_miss[x] == 2) {
+                early[x]  = g.n_slots; // remote
+            } else if (split_miss[x]) {
                 early[x]  = g.n_slots;
                 late[j]   = s;
                 merge[j]  = (int32_t) i;
@@ -3242,11 +3853,12 @@ struct llama_moe_cache::impl {
             }
             split_miss[x] = 0;
         }
+        split_late_used = j;
         for (; j < (size_t) split_late_max; ++j) {
             late[j]  = g.n_slots;
             merge[j] = n_expert_used;
         }
-        n_split_early_hits += n_ids - n_miss;
+        n_split_early_hits += n_ids - n_miss - n_remote;
         n_split_late += n_miss;
         n_split_calls++;
         if (!sync && !jobs.empty()) {
@@ -3291,6 +3903,10 @@ struct llama_moe_cache::impl {
         stats_store_decode.hits   += n_hit;
         stats_store_decode.misses += fills.size();
         stats_store_decode.bytes  += fills.size()*g.record_size;
+        if (remote_il == il) {
+            remote_resolve(il, l, g);
+        }
+        remote_il = -1;
         if (snapshot_every_s > 0 && !snapshot_path.empty() &&
                 std::chrono::duration_cast<std::chrono::seconds>(t2 - t_snapshot_last).count() >= snapshot_every_s) {
             t_snapshot_last = t2;
@@ -3304,6 +3920,177 @@ struct llama_moe_cache::impl {
         }
         GGML_UNUSED(ids_data);
         GGML_UNUSED(n_ids);
+    }
+
+    // remote experts, "moe_rpost-<il>": the GPU has copied the experts' input into the layer's remote input; send it
+    // with each box's candidates (the slots fill_early found free are still free: only this thread posts)
+    void remote_post(int32_t il) {
+        if (!remote_on() || remote_il != il || remote_ids.empty()) {
+            return;
+        }
+        const layer & l = layers[il];
+        std::atomic_thread_fence(std::memory_order_acquire);
+        for (size_t bx = 0; bx < remotes.size(); ++bx) {
+            if (remote_cnt[bx] == 0 || remote_slot[bx] != nullptr) {
+                continue;
+            }
+            remote_client & rc = *remotes[bx];
+            remote_client::slot * s = rc.next_free();
+            if (s == nullptr) {
+                rc.n_unsent++; // the link dropped since the early lookup: the real lookup reads them
+                continue;
+            }
+            const int k = remote_cnt[bx];
+            s->hdr[0] = k;
+            for (int r = 0; r < remote_client::KMAX; ++r) {
+                s->hdr[1 + r] = r < k ? il*(int32_t) store.n_expert + remote_ids[remote_off[bx] + r] : 0;
+            }
+            memcpy(s->x.data(), l.remote_x->data, ggml_nbytes(l.remote_x));
+            rc.post(s);
+            remote_slot[bx] = s;
+            rc.n_posts++;
+            rc.n_rows += k;
+        }
+    }
+
+    // a reply row is used only if it is all numbers: a server answers NaN rows for ids it does not hold
+    static bool remote_row_ok(const float * r, size_t n) {
+        uint32_t bad = 0;
+        for (size_t i = 0; i < n; ++i) {
+            bad |= (uint32_t) (r[i] != r[i]);
+        }
+        return bad == 0;
+    }
+
+    // remote experts, at the real lookup (after the local reads): wait for each box's reply until its deadline, place
+    // the rows that arrived (remote rows + merge positions), then read every missing expert here into the late
+    // matmul's free rows
+    void remote_resolve(int32_t il, layer & l, group & g) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t row = (size_t) l.remote_rows->ne[0];
+        int32_t * rm = (int32_t *) l.rmerge_map->data;
+        remote_miss_ids.clear();
+        remote_miss_pos.clear();
+        for (size_t bx = 0; bx < remotes.size(); ++bx) {
+            const int k = remote_cnt[bx];
+            if (k == 0) {
+                continue;
+            }
+            remote_client & rc = *remotes[bx];
+            remote_client::slot * s = remote_slot[bx];
+            remote_slot[bx] = nullptr;
+            const int off = remote_off[bx];
+            int n_ok = 0; // rows of this box placed
+            if (s != nullptr) {
+                const auto deadline = s->t_post + std::chrono::microseconds(rc.deadline_us);
+                int st = s->state.load(std::memory_order_acquire);
+                if (!remote_shadow) {
+                    while ((st == remote_client::QUEUED || st == remote_client::SENT) && std::chrono::steady_clock::now() < deadline) {
+                        st = s->state.load(std::memory_order_acquire);
+                    }
+                }
+                // the rows complete now: all of them, or the first ones of a reply still streaming in (the net thread
+                // only writes past them from here on)
+                bool done = st == remote_client::DONE;
+                int n_rows = done ? k : s->rows_done.load(std::memory_order_acquire);
+                if (!done) {
+                    if (rc.abandon(s)) {
+                        done = true;
+                        n_rows = k;
+                    } else if (s->state.load(std::memory_order_acquire) == remote_client::FREE) {
+                        n_rows = 0; // the link broke and the slot was reset: read them all locally
+                    }
+                }
+                n_rows = std::min(n_rows, k);
+                if (done) {
+                    const auto rtt = std::chrono::duration_cast<std::chrono::microseconds>(s->t_done - s->t_post).count();
+                    rc.rtt_us[rc.rtt_next++ % rc.rtt_us.size()] = (uint32_t) std::max<int64_t>(0, rtt);
+                }
+                if (remote_shadow) {
+                    rc.n_shadow_ontime += done;
+                } else {
+                    for (int r = 0; r < n_rows; ++r) {
+                        const float * src = s->rows.data() + (size_t) r*row;
+                        if (!remote_row_ok(src, row)) {
+                            rc.n_nan_rows++;
+                            break; // this row and the rest are read locally
+                        }
+                        memcpy((float *) l.remote_rows->data + (size_t) (off + r)*row, src, row*sizeof(float));
+                        rm[off + r] = remote_pos[off + r];
+                        n_ok++;
+                    }
+                    rc.n_hits += n_ok;
+                    rc.n_partial += !done && n_ok > 0;
+                }
+                if (done) {
+                    s->state.store(remote_client::FREE, std::memory_order_release);
+                }
+            }
+            if (remote_shadow) {
+                continue;
+            }
+            if (n_ok == k) {
+                rc.misses_in_row = 0;
+            } else {
+                rc.misses_in_row++;
+                rc.n_late++;
+                rc.n_late_rows += k - n_ok;
+                for (int r = n_ok; r < k; ++r) {
+                    remote_miss_ids.push_back(remote_ids[off + r]);
+                    remote_miss_pos.push_back(remote_pos[off + r]);
+                }
+            }
+        }
+        if (!remote_miss_ids.empty()) {
+            // missed the deadline, never sent, a partial or a refused reply: the same experts from the store, into the
+            // late matmul's free rows (fill_early kept local misses + remote candidates within its rows)
+            size_t n_hit = 0;
+            fill_plan(il, remote_miss_ids.data(), remote_miss_ids.size(), true, n_hit);
+            if (!jobs.empty() && !pool->run(store.fd, jobs)) {
+                GGML_ABORT("expert store: read failed for layer %d: %s", il, strerror(errno));
+            }
+            fill_adopt(il);
+            int32_t * late  = (int32_t *) l.late_map->data;
+            int32_t * merge = (int32_t *) l.merge_map->data;
+            size_t j = split_late_used;
+            for (size_t r = 0; r < remote_miss_ids.size(); ++r) {
+                GGML_ASSERT(j < (size_t) split_late_max);
+                late[j]  = g.lru.slot_map[il][remote_miss_ids[r]];
+                merge[j] = remote_miss_pos[r];
+                j++;
+            }
+            stats_small.misses        += fills.size();
+            stats_small.hits          += n_hit;
+            stats_small.bytes         += fills.size()*g.record_size;
+            stats_store_decode.misses += fills.size();
+            stats_store_decode.hits   += n_hit;
+            stats_store_decode.bytes  += fills.size()*g.record_size;
+            n_remote_fallback_layers++;
+        }
+        t_remote_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    }
+
+    void remote_log(const char * func) const {
+        if (!remote_on()) {
+            return;
+        }
+        LLAMA_LOG_INFO("%s: expert store: remote experts%s: %llu layers with candidates, %llu of them read some locally; wait at the real lookup %.3f ms per layer with candidates\n", func,
+            remote_shadow ? " (SHADOW)" : "", (unsigned long long) n_remote_layers, (unsigned long long) n_remote_fallback_layers,
+            n_remote_layers ? t_remote_wait_us/1e3/n_remote_layers : 0.0);
+        for (const auto & p : remotes) {
+            const remote_client & rc = *p;
+            std::vector<uint32_t> v(rc.rtt_us.begin(), rc.rtt_us.begin() + std::min(rc.rtt_next, rc.rtt_us.size()));
+            std::sort(v.begin(), v.end());
+            auto pct = [&](double q) { return v.empty() ? 0.0 : v[(size_t) (q*(v.size() - 1))]/1e3; };
+            LLAMA_LOG_INFO("%s: expert store: remote box %d (%s:%d, %s): %llu posts, %.2f rows per post, %llu rows placed, %llu requests short (%llu rows read locally, %llu partial replies, %llu NaN rows), %llu unsent, %llu breaker trips%s; RTT p50 %.2f p90 %.2f p99 %.2f ms (%zu replies); %llu connects, %llu drops (%llu stale)\n", func,
+                rc.id, rc.host.c_str(), rc.port, rc.connected.load() ? "up" : "DOWN",
+                (unsigned long long) rc.n_posts, rc.n_posts ? (double) rc.n_rows/rc.n_posts : 0.0, (unsigned long long) rc.n_hits,
+                (unsigned long long) rc.n_late, (unsigned long long) rc.n_late_rows, (unsigned long long) rc.n_partial, (unsigned long long) rc.n_nan_rows,
+                (unsigned long long) rc.n_unsent, (unsigned long long) rc.n_trips,
+                remote_shadow ? (", " + std::to_string(rc.n_shadow_ontime) + " replies by the real lookup").c_str() : "",
+                pct(0.5), pct(0.9), pct(0.99), v.size(),
+                (unsigned long long) rc.n_connects.load(), (unsigned long long) rc.n_disconnects.load(), (unsigned long long) rc.n_stale.load());
+        }
     }
 
     // the self-prefetch post: layer il's real experts, read now while the GPU computes the shared expert; the real
@@ -3390,6 +4177,17 @@ struct llama_moe_cache::impl {
             return;
         }
         spec_reclaim(); // a prediction not started by now is stale
+        if (remote_on() && !remote_shadow && l.rpost_map != nullptr) {
+            // the remote experts are not read ahead: saving the drive those reads is the point
+            remote_pf.clear();
+            for (size_t i = 0; i < n_ids; ++i) {
+                if (!(g.lru.slot_map[il][ids_data[i]] < 0 && remote_box_of(il, ids_data[i]) >= 0)) {
+                    remote_pf.push_back(ids_data[i]);
+                }
+            }
+            ids_data = remote_pf.data();
+            n_ids = remote_pf.size();
+        }
         size_t n_hit = 0;
         if (!g.lru.plan(il, ids_data, n_ids, fills, n_hit, true)) {
             return;
@@ -3666,6 +4464,7 @@ struct llama_moe_cache::impl {
                 (unsigned long long) n_split_calls, (double) n_split_early_hits/n_split_calls, n_expert_used, (double) n_split_late/n_split_calls, split_late_max,
                 (unsigned long long) n_split_sync, (double) n_split_sync_records/n_split_calls, t_split_plan_us/1e3/n_split_calls, t_split_wait_us/1e3/n_split_calls, (unsigned long long) n_split_fallback);
         }
+        remote_log(func);
         if (self_prefetch && n_self_calls > 0) {
             LLAMA_LOG_INFO("%s: expert store: self-prefetch: %llu posts, %.1f records and %.2f ms of reads per post\n", func,
                 (unsigned long long) n_self_calls, (double) n_self_reads/n_self_calls, t_self_io_us/1e3/n_self_calls);
@@ -3800,6 +4599,10 @@ struct llama_moe_cache::impl {
             case 3: return l.merge_map;
             case 4: return groups[l.ig].dummy_const;
             case 5: return split_iota;
+            case 6: return remote_on() ? l.rpost_map   : nullptr;
+            case 7: return remote_on() ? l.remote_x    : nullptr;
+            case 8: return remote_on() ? l.remote_rows : nullptr;
+            case 9: return remote_on() ? l.rmerge_map  : nullptr;
             default: return nullptr;
         }
     }

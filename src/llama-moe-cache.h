@@ -43,7 +43,10 @@ public:
     // read. get_split_map: kind 1 early map, 2 late map, 3 merge map, 4 the zero record's slot as an I32 [1, 1].
     bool split_enabled() const;
     // kind 5: an I32 [n_expert_used] of 0, 1, ...; the late and merge maps are read by position with its first
-    // split_late_rows() entries
+    // split_late_rows() entries.
+    // Remote experts (LLAMA_EXPERT_STORE_REMOTE, layers with experts in the remote set only, else nullptr): kind 6 the
+    // map of the "moe_rpost-<il>" post, 7 the layer's expert input (F32 [n_in]) the graph copies there before the
+    // post, 8 the remote rows (F32 [n_out, n_remote_rows]), 9 their merge positions (I32 [1, n_expert], by position)
     ggml_tensor * get_split_map(int32_t il, int64_t n_tokens, int kind) const;
     int split_late_rows() const;
     // the experts of w in the cache with the zero record included (one more slot), for the split matmuls

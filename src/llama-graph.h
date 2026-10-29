@@ -1073,6 +1073,11 @@ struct llm_graph_context {
     mutable ggml_tensor * moe_split_pf    = nullptr;
     mutable bool          moe_split_bank  = false; // build_lora_mm_id: index the bank with the zero record included
     mutable bool          moe_split_allowed = false; // set by build_moe_ffn around build_moe_cache_slots
+    // remote experts (LLAMA_EXPERT_STORE_REMOTE, see llama_moe_cache::get_split_map kinds 6-9): the experts' input,
+    // set by build_moe_ffn for build_moe_cache_slots, and the remote rows + their merge positions it leaves back
+    mutable ggml_tensor * moe_split_input  = nullptr;
+    mutable ggml_tensor * moe_split_rrows  = nullptr;
+    mutable ggml_tensor * moe_split_rmerge = nullptr;
     // set by the model for one build_moe_ffn: given the weighted sum of the early output's rows (the resident
     // experts' share of the routed output, [n_embd, n_tokens]), builds the next layer's prefetch post and returns it
     mutable std::function<ggml_tensor * (ggml_tensor *)> moe_split_partial_cb;
