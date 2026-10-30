@@ -24,6 +24,9 @@ def main():
     p.add_argument('--cache-mib', type=int, default=102400)
     p.add_argument('--gpu-layers', type=int, default=20)
     p.add_argument('--threads', type=int, default=16)
+    p.add_argument('--op-offload', action='store_true', help='Allow host operations on GPU; can require very large buffers')
+    p.add_argument('--batch', type=int, default=32)
+    p.add_argument('--ubatch', type=int, default=32)
     p.add_argument('--context-per-slot', type=int, default=2048)
     p.add_argument('--parallel', type=int, default=1)
     p.add_argument('--port', type=int, default=8080)
@@ -32,7 +35,7 @@ def main():
     p.add_argument('--startup-timeout', type=int, default=1800)
     p.add_argument('--dry-run', action='store_true')
     args = p.parse_args()
-    if min(args.cache_mib,args.threads,args.context_per_slot,args.parallel,args.startup_timeout) <= 0 or args.gpu_layers < 0:
+    if min(args.cache_mib,args.threads,args.context_per_slot,args.parallel,args.startup_timeout,args.batch,args.ubatch) <= 0 or args.gpu_layers < 0:
         p.error('Memory, thread, context and time limits must be positive')
     repo = args.repo.resolve()
     executable = repo/'build/bin/llama-server'
@@ -41,8 +44,9 @@ def main():
                '--n-cpu-moe','93','--moe-cache-mib',str(args.cache_mib),
                '--load-mode','mmap','--fit','off','--no-warmup','--no-context-shift',
                '-c',str(args.context_per_slot*args.parallel),'--parallel',str(args.parallel),
-               '-b','32','-ub','32','--threads',str(args.threads),
+               '-b',str(args.batch),'-ub',str(args.ubatch),'--threads',str(args.threads),
                '--host','127.0.0.1','--port',str(args.port),'--metrics','-lv','4']
+    command.append('--op-offload' if args.op_offload else '--no-op-offload')
     overrides = {'LLAMA_EXPERT_STORE': str(store), 'LLAMA_EXPERT_STORE_KEEP_PAGE_CACHE':'1',
                  'LLAMA_EXPERT_STORE_MLOCK':'0','LLAMA_EXPERT_STORE_GPU':'0',
                  'LLAMA_EXPERT_STORE_SECOND_CHANCE':str(args.second_chance),
@@ -100,10 +104,22 @@ def main():
                     telemetry.write(json.dumps(sample)+'\n')
                     telemetry.flush()
                     time.sleep(2)
-            return process.returncode
+            code = process.returncode
+            if code != 0 or not ready:
+                console.print(f'Server exited with code {code}; ready={ready}.', style='bold red')
+                lines = (folder/'server.log').read_text(errors='replace').splitlines()
+                console.print('\n'.join(lines[-50:]), markup=False)
+                console.print(f'Full log: {folder / "server.log"}', style='yellow')
+                return code if code and code > 0 else 1
+            console.print('Server stopped.', style='yellow')
+            return 0
     except KeyboardInterrupt:
         console.print('[yellow]Stopping server.[/]')
         return 130
+    except Exception as exc:
+        console.print(f'{type(exc).__name__}: {exc}', style='red', markup=False)
+        console.print(f'Inspect {folder / "server.log"}')
+        return 1
     finally:
         if process and process.poll() is None:
             os.killpg(process.pid,signal.SIGTERM)

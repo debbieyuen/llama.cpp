@@ -185,3 +185,13 @@ suites for shorter experiments; the full sequence is deliberately substantial.
 
 Reference requirements: https://docs.google.com/spreadsheets/d/1ypENMBfY8rBuph0EWbyrNJPxsLaPStk0Xn20IjYJnGw/edit?gid=695739133
 The spreadsheet was read as project context; its existing results were not modified.
+
+### A10 compute-buffer allocation failure
+
+The initial Kimi K3 attempt requested 86,843.90 MiB of CUDA compute buffers and
+failed before serving. The launcher now defaults to `--no-op-offload` to prevent
+the scheduler from offloading host-tensor operations to CUDA. Explicit GPU layers
+remain enabled. This targets the suspected source of the oversized buffer; actual
+memory fit still needs a new A10 run. `--op-offload` restores the previous behavior
+for controlled comparisons. `--batch` and `--ubatch` expose both batch limits.
+Server failures now print the exit code and final 50 log lines.
